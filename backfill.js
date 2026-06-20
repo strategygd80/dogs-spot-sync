@@ -185,6 +185,51 @@ async function fetchAppointmentsForCalendar(calendarId) {
 }
 
 // ------------------------------------------------------------
+// CUSTOM FIELD DISCOVERY — DOG NAME
+// GHL stores "Dog's Name" as a custom field on the contact, keyed
+// by field ID inside contact.customFields, e.g.:
+//   contact.customFields = [{ id: 'abc123', value: 'Rex' }, ...]
+// We don't know the field ID ahead of time, so we fetch the
+// account's custom field definitions once, find the one whose
+// name/fieldKey looks like a dog-name field, and use that ID to
+// pull the value off each contact going forward.
+// ------------------------------------------------------------
+let DOG_NAME_FIELD_ID = null;
+let _customFieldsChecked = false;
+
+async function discoverDogNameFieldId() {
+  if (_customFieldsChecked) return DOG_NAME_FIELD_ID;
+  _customFieldsChecked = true;
+  try {
+    const res = await ghl.get('/custom-fields/');
+    const fields = res.data?.customFields || [];
+    const match = fields.find(f =>
+      /dog.?s?.?name/i.test(f.name || '') || /dog.?s?.?name/i.test(f.fieldKey || '')
+    );
+    if (match) {
+      DOG_NAME_FIELD_ID = match.id;
+      console.log(`Found dog name custom field: "${match.name}" (${match.fieldKey}) -> id ${match.id}`);
+    } else {
+      console.warn('WARNING: Could not find a custom field matching "dog name". Dog names will not be backfilled. Available custom fields:');
+      fields.forEach(f => console.warn(`  - ${f.name} (${f.fieldKey})`));
+    }
+  } catch (err) {
+    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
+  }
+  return DOG_NAME_FIELD_ID;
+}
+
+function resolveDogName(contact) {
+  if (!contact || !DOG_NAME_FIELD_ID) return null;
+  const customFields = contact.customFields || contact.customField || [];
+  const entry = Array.isArray(customFields)
+    ? customFields.find(f => f.id === DOG_NAME_FIELD_ID)
+    : null;
+  const value = entry?.value || entry?.fieldValue || null;
+  return value && String(value).trim() ? String(value).trim() : null;
+}
+
+// ------------------------------------------------------------
 // FETCH CONTACT DETAILS
 // ------------------------------------------------------------
 const contactCache = new Map();
@@ -206,6 +251,8 @@ async function getContact(contactId) {
 // ------------------------------------------------------------
 async function backfill() {
   console.log(DRY_RUN ? 'Starting backfill (DRY RUN — no writes to Supabase)...\n' : 'Starting backfill...\n');
+
+  await discoverDogNameFieldId();
 
   // Step 1: pull all appointments from all four calendars
   let allAppointments = [];
@@ -342,6 +389,8 @@ async function backfill() {
       else if (endStr < todayStr) status = 'completed';
     }
 
+    const resolvedDogName = resolveDogName(contact);
+
     const payload = {
       ghl_dropoff_appointment_id: dropoff?.id || null,
       ghl_pickup_appointment_id:  pickup?.id  || null,
@@ -351,7 +400,7 @@ async function backfill() {
       owner_name:   resolveOwnerName(contact),
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
-      dog_name:     null, // not reliably available from appointment data — can be backfilled later from custom fields
+      dog_name:     resolvedDogName,
       start_date:   dropoff?.startTime || null,
       end_date:     pickup?.startTime  || null,
       source,
@@ -372,15 +421,21 @@ async function backfill() {
       // Check if this stay already exists (by either appointment ID)
       let existing = null;
       if (payload.ghl_dropoff_appointment_id) {
-        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_dropoff_appointment_id', payload.ghl_dropoff_appointment_id).limit(1);
+        const { data } = await supabase.from('boarding_stays').select('id, dog_name, owner_name').eq('ghl_dropoff_appointment_id', payload.ghl_dropoff_appointment_id).limit(1);
         if (data && data.length) existing = data[0];
       }
       if (!existing && payload.ghl_pickup_appointment_id) {
-        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_pickup_appointment_id', payload.ghl_pickup_appointment_id).limit(1);
+        const { data } = await supabase.from('boarding_stays').select('id, dog_name, owner_name').eq('ghl_pickup_appointment_id', payload.ghl_pickup_appointment_id).limit(1);
         if (data && data.length) existing = data[0];
       }
 
       if (existing) {
+        // Never let a missing/unresolved value erase data that's already
+        // there (e.g. dog_name entered manually in the portal, or an
+        // owner_name we previously resolved but couldn't re-derive now).
+        if (!payload.dog_name   && existing.dog_name)   payload.dog_name   = existing.dog_name;
+        if (!payload.owner_name && existing.owner_name) payload.owner_name = existing.owner_name;
+
         await supabase.from('boarding_stays').update(payload).eq('id', existing.id);
         updated++;
       } else {
