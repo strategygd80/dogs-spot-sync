@@ -16,6 +16,10 @@ require('dotenv').config();
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
+// --dry-run: pair appointments and print what WOULD be written, but never
+// touch Supabase. Run this first after any pairing-logic change.
+const DRY_RUN = process.argv.includes('--dry-run');
+
 const CONFIG = {
   GHL_TOKEN:    process.env.GHL_TOKEN,
   GHL_LOCATION: process.env.GHL_LOCATION,
@@ -66,8 +70,9 @@ const CONFIG = {
   LOOKBACK_DAYS:  90,   // pull past appointments up to 90 days ago
   LOOKAHEAD_DAYS: 180,  // pull future appointments up to 180 days ahead
 
-  // Window in hours within which two appointments are considered the same booking
-  PAIRING_WINDOW_HOURS: 4, // wider than live sync since backfill timestamps are less precise
+  // NOTE: pairing is no longer a symmetric +/- hour window (see MAX_STAY_DAYS
+  // near the pairing logic below). A pickup can now only pair with a dropoff
+  // at or before it, and ties are broken by closest time gap.
 
   // Business timezone — used to correctly determine "today" for status calculation
   TIMEZONE: 'America/New_York',
@@ -156,7 +161,7 @@ async function getContact(contactId) {
 // MAIN BACKFILL LOGIC
 // ------------------------------------------------------------
 async function backfill() {
-  console.log('Starting backfill...\n');
+  console.log(DRY_RUN ? 'Starting backfill (DRY RUN — no writes to Supabase)...\n' : 'Starting backfill...\n');
 
   // Step 1: pull all appointments from all four calendars
   let allAppointments = [];
@@ -178,6 +183,20 @@ async function backfill() {
   allAppointments.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
   // Step 3: group into stays by contactId + service_type + proximity
+  //
+  // Pairing rules (fixed):
+  //   1. A pickup may only pair with a dropoff that happened at or before it.
+  //      This stops a pickup from accidentally pairing with a *later*
+  //      dropoff and producing end_date < start_date rows.
+  //   2. Among all open, eligible stays for a contact+serviceType, pick the
+  //      CLOSEST one in time, not the first one encountered in array order.
+  //      This matters for repeat/back-to-back boarders.
+  //   3. Max span between dropoff and pickup is capped (see MAX_STAY_DAYS)
+  //      so we don't pair a dropoff with some unrelated pickup weeks later
+  //      just because the contact had no other open stay.
+  const MAX_STAY_DAYS = 30; // generous ceiling for a single boarding stay
+  const maxSpanMs = MAX_STAY_DAYS * 86400000;
+
   const stays = []; // { dropoff, pickup, contactId, serviceType }
 
   for (const appt of allAppointments) {
@@ -190,26 +209,43 @@ async function backfill() {
 
     const contactId = appt.contactId;
     const apptTime  = new Date(appt.startTime).getTime();
-    const windowMs  = CONFIG.PAIRING_WINDOW_HOURS * 3600 * 1000;
 
-    // Try to find an existing incomplete stay for this contact + service type within the window
-    let matched = null;
+    // Collect every open, eligible stay for this contact + service type,
+    // then choose the closest in time rather than the first match found.
+    let best = null;
+    let bestDelta = Infinity;
+
     for (const stay of stays) {
       if (stay.contactId !== contactId) continue;
       if (stay.serviceType !== serviceType) continue; // never cross-pair different services
-      const refTime = stay.dropoff
-        ? new Date(stay.dropoff.startTime).getTime()
-        : new Date(stay.pickup.startTime).getTime();
 
-      if (Math.abs(apptTime - refTime) <= windowMs * 20) { // wider tolerance: stays can span days
-        if (isDropoff && !stay.dropoff) { matched = stay; break; }
-        if (isPickup  && !stay.pickup)  { matched = stay; break; }
+      if (isDropoff && !stay.dropoff && stay.pickup) {
+        // Filling in a missing dropoff for a stay that already has a pickup.
+        // The dropoff must be at or before that pickup.
+        const pickupTime = new Date(stay.pickup.startTime).getTime();
+        const delta = pickupTime - apptTime;
+        if (delta >= 0 && delta <= maxSpanMs && delta < bestDelta) {
+          best = stay; bestDelta = delta;
+        }
+      } else if (isPickup && !stay.pickup && stay.dropoff) {
+        // Filling in a missing pickup for a stay that already has a dropoff.
+        // The pickup must be at or after that dropoff.
+        const dropoffTime = new Date(stay.dropoff.startTime).getTime();
+        const delta = apptTime - dropoffTime;
+        if (delta >= 0 && delta <= maxSpanMs && delta < bestDelta) {
+          best = stay; bestDelta = delta;
+        }
+      } else if (isDropoff && !stay.dropoff && !stay.pickup) {
+        // Shouldn't normally happen (empty stay shouldn't exist), but guard anyway.
+        best = best || stay;
+      } else if (isPickup && !stay.pickup && !stay.dropoff) {
+        best = best || stay;
       }
     }
 
-    if (matched) {
-      if (isDropoff) matched.dropoff = appt;
-      if (isPickup)  matched.pickup  = appt;
+    if (best) {
+      if (isDropoff) best.dropoff = appt;
+      if (isPickup)  best.pickup  = appt;
     } else {
       stays.push({
         contactId,
@@ -273,6 +309,12 @@ async function backfill() {
     };
 
     try {
+      if (DRY_RUN) {
+        console.log(`  [dry-run] would upsert ${contact?.name || contactId} — ${payload.start_date ? new Date(payload.start_date).toDateString() : '?'} -> ${payload.end_date ? new Date(payload.end_date).toDateString() : '?'} [${status}] (dropoff:${payload.ghl_dropoff_appointment_id || 'none'} pickup:${payload.ghl_pickup_appointment_id || 'none'})`);
+        if (status === 'incomplete') incomplete++;
+        continue;
+      }
+
       // Check if this stay already exists (by either appointment ID)
       let existing = null;
       if (payload.ghl_dropoff_appointment_id) {
@@ -302,7 +344,7 @@ async function backfill() {
   }
 
   console.log(`\n========================================`);
-  console.log(`Backfill complete.`);
+  console.log(DRY_RUN ? `Dry run complete. No data was written.` : `Backfill complete.`);
   console.log(`  Created:    ${created}`);
   console.log(`  Updated:    ${updated}`);
   console.log(`  Incomplete: ${incomplete} (missing drop off or pick up)`);
