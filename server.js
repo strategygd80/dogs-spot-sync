@@ -97,6 +97,28 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 }
 
 // ------------------------------------------------------------
+// NAME RESOLUTION
+// GHL's contact API can return name fields under different keys
+// depending on account/version. Rather than guessing one key,
+// check every plausible variant so this works regardless.
+// ------------------------------------------------------------
+function resolveOwnerName(contact) {
+  if (!contact) return null;
+
+  const fullNameCandidates = [contact.name, contact.fullName, contact.full_name, contact.contactName];
+  for (const candidate of fullNameCandidates) {
+    if (candidate && String(candidate).trim()) return String(candidate).trim();
+  }
+
+  const first = contact.firstName || contact.first_name || contact.firstname || '';
+  const last  = contact.lastName  || contact.last_name  || contact.lastname  || '';
+  const combined = [first, last].filter(Boolean).join(' ').trim();
+  if (combined) return combined;
+
+  return null;
+}
+
+// ------------------------------------------------------------
 // SUPABASE CLIENT
 // ------------------------------------------------------------
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
@@ -271,7 +293,7 @@ async function processAppointment(payload, eventType) {
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
       // Fill contact info if missing
-      owner_name:  pairableStay.owner_name  || contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
+      owner_name:  pairableStay.owner_name  || resolveOwnerName(contact),
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
     };
@@ -285,7 +307,7 @@ async function processAppointment(payload, eventType) {
 
     const insertPayload = {
       contact_id:   contactId,
-      owner_name:   contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
+      owner_name:   resolveOwnerName(contact),
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
       source,
@@ -416,14 +438,20 @@ app.get('/api/dashboard/today', async (req, res) => {
     // Pull a window of candidates, then filter precisely in JS using
     // timezone-aware date comparison (Postgres date range queries on
     // raw timestamps would hit the same UTC-boundary bug).
-    const { data: allActive } = await supabase
+    //
+    // IMPORTANT: only exclude 'cancelled' here, not 'incomplete'.
+    // A stay can be 'incomplete' (missing its pickup pairing) while
+    // still having a real dropoff appointment today — that dog is
+    // still arriving and staff still need to see it on the dashboard.
+    // 'active' (below) still correctly requires both dates to be set.
+    const { data: allStays } = await supabase
       .from('boarding_stays')
       .select('*')
-      .not('status', 'in', '("cancelled","incomplete")');
+      .neq('status', 'cancelled');
 
-    const arrivals   = (allActive || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === todayStr);
-    const departures = (allActive || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === todayStr);
-    const active      = (allActive || []).filter(s => {
+    const arrivals   = (allStays || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === todayStr);
+    const departures = (allStays || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === todayStr);
+    const active      = (allStays || []).filter(s => {
       if (!s.start_date || !s.end_date) return false;
       const startStr = getDateStringInTZ(new Date(s.start_date));
       const endStr   = getDateStringInTZ(new Date(s.end_date));
