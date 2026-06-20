@@ -144,11 +144,16 @@ async function fetchAppointmentsForCalendar(calendarId) {
 // FETCH CONTACT DETAILS
 // ------------------------------------------------------------
 const contactCache = new Map();
+let _debugContactLogged = false; // TEMP — prints raw shape of first contact fetched, then stops. Remove after confirming field names.
 async function getContact(contactId) {
   if (contactCache.has(contactId)) return contactCache.get(contactId);
   try {
     const res = await ghl.get(`/contacts/${contactId}`);
     const contact = res.data?.contact || null;
+    if (!_debugContactLogged) {
+      _debugContactLogged = true;
+      console.log('\n[DEBUG] Raw contact object from GHL API:\n', JSON.stringify(contact, null, 2), '\n');
+    }
     contactCache.set(contactId, contact);
     return contact;
   } catch (err) {
