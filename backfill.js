@@ -1,58 +1,107 @@
 // ============================================================
-// The Dogs Spot — One-Time Backfill Script
-// Pulls existing GHL boarding appointments into Supabase
-// so the portal isn't empty while waiting on live webhooks.
-//
-// Safe to re-run — upserts by GHL appointment ID, no duplicates.
-//
+// The Dogs Spot — Backfill Existing Appointments
+// One-time script: pulls all existing appointments from the
+// four boarding calendars and pairs them into boarding_stays
+// ============================================================
 // Setup:
-//   npm install
+//   npm install @supabase/supabase-js axios dotenv
 //   node backfill.js
+//
+// Run this ONCE after deploying server.js and before (or after)
+// setting up the live workflow webhooks. Safe to re-run — it
+// upserts by GHL appointment ID, so it won't create duplicates.
 // ============================================================
 
 require('dotenv').config();
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// ------------------------------------------------------------
-// CONFIG — same values as server.js, pulled from .env
-// ------------------------------------------------------------
 const CONFIG = {
   GHL_TOKEN:    process.env.GHL_TOKEN,
   GHL_LOCATION: process.env.GHL_LOCATION,
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_KEY: process.env.SUPABASE_KEY,
 
+  // Calendar IDs — same mapping as server.js, kept in sync
   CALENDARS: {
-    DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
-    DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',   // Boarding Drop Off - Online
-    PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
-    PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',   // Boarding Pick Up - Online
+    boarding: {
+      DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
+      DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
+      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
+      PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
+    },
+    basic: {
+      DROPOFF_INPERSON: '34JtodEqRp3K2wLp0a0y',   // Basic Drop Off
+      PICKUP_INPERSON:  'U53Ci7ndlS0NIkAa6vya',   // Basic Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    leash_free: {
+      DROPOFF_INPERSON: 'MXqoZqw2t3ewo1Oxja2m',   // Leash Free Drop Off
+      PICKUP_INPERSON:  'QBN6Y6UGIgDufXHz6B2I',    // Leash Free Pick Up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    service_dog: {
+      DROPOFF_INPERSON: 'U0sp9FfaU9qOiWp1Upb',     // Service Dog Drop Off
+      PICKUP_INPERSON:  '8rQdqxN39H6Db3Duf5ZX',    // Service Dog Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    community: {
+      DROPOFF_INPERSON: 'WMnuQPTsY8tz3JaxqPPf',    // Community Drop Off
+      PICKUP_INPERSON:  'DN6b9L0gVEwBI80v7Ctk',    // Community Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    bundle: {
+      DROPOFF_INPERSON: 'ZqzoS3ckFZafZcaUKyOM',    // Bundle Drop Off — confirm this ID
+      PICKUP_INPERSON:  '2sAl9Q61WM2WNTqLqcGj',    // Bundle Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
   },
 
-  // How far back/forward to pull appointments
-  LOOKBACK_DAYS:  90,
-  LOOKAHEAD_DAYS: 180,
+  // How far back/forward to pull appointments (adjust as needed)
+  LOOKBACK_DAYS:  90,   // pull past appointments up to 90 days ago
+  LOOKAHEAD_DAYS: 180,  // pull future appointments up to 180 days ahead
 
-  // Max hours apart for a Drop Off + Pick Up to be considered the same stay
-  PAIRING_WINDOW_HOURS: 24 * 14, // 14 days — boarding stays can run long
+  // Window in hours within which two appointments are considered the same booking
+  PAIRING_WINDOW_HOURS: 4, // wider than live sync since backfill timestamps are less precise
+
+  // Business timezone — used to correctly determine "today" for status calculation
+  TIMEZONE: 'America/New_York',
 };
 
-const DROPOFF_CALENDAR_IDS = new Set([
-  CONFIG.CALENDARS.DROPOFF_INPERSON,
-  CONFIG.CALENDARS.DROPOFF_ONLINE,
-]);
-const PICKUP_CALENDAR_IDS = new Set([
-  CONFIG.CALENDARS.PICKUP_INPERSON,
-  CONFIG.CALENDARS.PICKUP_ONLINE,
-]);
-
-if (!CONFIG.GHL_TOKEN || !CONFIG.GHL_LOCATION || !CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_KEY) {
-  console.error('Missing required env vars. Check your .env file has GHL_TOKEN, GHL_LOCATION, SUPABASE_URL, SUPABASE_KEY.');
-  process.exit(1);
+// Build lookup map: calendarId -> { serviceType, role, source }
+const CALENDAR_LOOKUP = {};
+for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
+  if (cals.DROPOFF_INPERSON) CALENDAR_LOOKUP[cals.DROPOFF_INPERSON] = { serviceType, role: 'dropoff', source: 'internal' };
+  if (cals.DROPOFF_ONLINE)   CALENDAR_LOOKUP[cals.DROPOFF_ONLINE]   = { serviceType, role: 'dropoff', source: 'online' };
+  if (cals.PICKUP_INPERSON)  CALENDAR_LOOKUP[cals.PICKUP_INPERSON]  = { serviceType, role: 'pickup',  source: 'internal' };
+  if (cals.PICKUP_ONLINE)    CALENDAR_LOOKUP[cals.PICKUP_ONLINE]    = { serviceType, role: 'pickup',  source: 'online' };
 }
 
+const ALL_CALENDAR_IDS = Object.keys(CALENDAR_LOOKUP);
+
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
+
+// ------------------------------------------------------------
+// TIMEZONE HELPER
+// Returns YYYY-MM-DD for a given date, evaluated in a specific
+// timezone — NOT the server's local time or raw UTC. This is
+// what fixes "today" being calculated one day off.
+// ------------------------------------------------------------
+function getDateStringInTZ(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return formatter.format(date); // en-CA locale formats as YYYY-MM-DD
+}
+
 
 const ghl = axios.create({
   baseURL: 'https://services.leadconnectorhq.com',
@@ -64,91 +113,37 @@ const ghl = axios.create({
 });
 
 // ------------------------------------------------------------
-// FETCH ALL APPOINTMENTS FOR A CALENDAR IN A DATE WINDOW
-// GHL paginates calendar events — loop until exhausted
+// FETCH ALL APPOINTMENTS FOR A CALENDAR
 // ------------------------------------------------------------
-async function fetchCalendarEvents(calendarId, startMs, endMs) {
-  const events = [];
-  let url = '/calendars/events';
-  let params = {
-    locationId: CONFIG.GHL_LOCATION,
-    calendarId,
-    startTime: startMs,
-    endTime: endMs,
-  };
+async function fetchAppointmentsForCalendar(calendarId) {
+  const startTime = Date.now() - CONFIG.LOOKBACK_DAYS  * 86400000;
+  const endTime   = Date.now() + CONFIG.LOOKAHEAD_DAYS * 86400000;
 
   try {
-    const res = await ghl.get(url, { params });
-    const batch = res.data?.events || res.data?.appointments || [];
-    events.push(...batch);
+    const res = await ghl.get('/calendars/events', {
+      params: {
+        locationId: CONFIG.GHL_LOCATION,
+        calendarId,
+        startTime,
+        endTime,
+      },
+    });
+    return res.data?.events || res.data?.appointments || [];
   } catch (err) {
-    console.error(`Failed to fetch events for calendar ${calendarId}:`, err.response?.data || err.message);
+    console.error(`Failed to fetch appointments for calendar ${calendarId}:`, err.response?.data || err.message);
+    return [];
   }
-
-  return events;
 }
 
 // ------------------------------------------------------------
-// GET CONTACT DETAILS (name/email/phone)
+// FETCH CONTACT DETAILS
 // ------------------------------------------------------------
-// ------------------------------------------------------------
-// CUSTOM FIELD LOOKUP — "Dog's Name" is stored as a contact
-// custom field in GHL, not in the appointment title.
-// ------------------------------------------------------------
-let dogNameFieldId = null;
-async function resolveDogNameFieldId() {
-  if (dogNameFieldId) return dogNameFieldId;
-  try {
-    const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
-    const fields = res.data?.customFields || [];
-
-    // Prefer exact match on the merge-field key (contact.dogs_name)
-    let match = fields.find(f => (f.fieldKey || '').toLowerCase() === 'contact.dogs_name');
-
-    // Fallback: loose match on the field's display name
-    if (!match) {
-      match = fields.find(f =>
-        (f.name || '').toLowerCase().includes("dog") &&
-        (f.name || '').toLowerCase().includes("name")
-      );
-    }
-
-    if (match) {
-      dogNameFieldId = match.id;
-      console.log(`Found "Dog's Name" custom field: ${match.name} (${match.id}, key: ${match.fieldKey})`);
-    } else {
-      console.warn('Could not find a custom field with key "contact.dogs_name" — dog names will be blank. Check field setup in GHL.');
-    }
-  } catch (err) {
-    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
-  }
-  return dogNameFieldId;
-}
-
-function extractDogName(contact, fieldId) {
-  if (!contact || !fieldId || !Array.isArray(contact.customFields)) return null;
-  const field = contact.customFields.find(f => f.id === fieldId);
-  return field?.value || field?.fieldValue || null;
-}
-
 const contactCache = new Map();
 async function getContact(contactId) {
-  if (!contactId) return null;
   if (contactCache.has(contactId)) return contactCache.get(contactId);
   try {
     const res = await ghl.get(`/contacts/${contactId}`);
-    const raw = res.data?.contact || null;
-    if (!raw) { contactCache.set(contactId, null); return null; }
-
-    // GHL doesn't reliably return a flat "name" field — build one from parts
-    const fullName =
-      raw.name ||
-      raw.contactName ||
-      [raw.firstName, raw.lastName].filter(Boolean).join(' ').trim() ||
-      raw.email ||
-      null;
-
-    const contact = { ...raw, name: fullName };
+    const contact = res.data?.contact || null;
     contactCache.set(contactId, contact);
     return contact;
   } catch (err) {
@@ -158,177 +153,164 @@ async function getContact(contactId) {
 }
 
 // ------------------------------------------------------------
-// MAIN BACKFILL
+// MAIN BACKFILL LOGIC
 // ------------------------------------------------------------
-async function run() {
-  await resolveDogNameFieldId();
+async function backfill() {
+  console.log('Starting backfill...\n');
 
-  const now = Date.now();
-  const startMs = now - CONFIG.LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
-  const endMs   = now + CONFIG.LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000;
-
-  console.log(`Pulling appointments from ${new Date(startMs).toISOString()} to ${new Date(endMs).toISOString()}`);
-
-  // 1. Pull every appointment from all four boarding calendars
-  let allEvents = [];
-  for (const [label, calendarId] of Object.entries(CONFIG.CALENDARS)) {
-    console.log(`Fetching calendar: ${label} (${calendarId})...`);
-    const events = await fetchCalendarEvents(calendarId, startMs, endMs);
-    console.log(`  → ${events.length} appointments found`);
-    allEvents.push(...events.map(e => ({ ...e, _calendarId: calendarId })));
+  // Step 1: pull all appointments from all four calendars
+  let allAppointments = [];
+  for (const calendarId of ALL_CALENDAR_IDS) {
+    console.log(`Fetching appointments for calendar ${calendarId}...`);
+    const appts = await fetchAppointmentsForCalendar(calendarId);
+    console.log(`  -> found ${appts.length} appointments`);
+    allAppointments.push(...appts.map(a => ({ ...a, calendarId: a.calendarId || calendarId })));
   }
 
-  if (allEvents.length === 0) {
-    console.log('No appointments found in the given window. Nothing to backfill.');
+  console.log(`\nTotal appointments fetched: ${allAppointments.length}\n`);
+
+  if (allAppointments.length === 0) {
+    console.log('No appointments found. Check calendar IDs and date range.');
     return;
   }
 
-  // 2. Group by contact, separating dropoff/pickup
-  const byContact = new Map();
-  for (const ev of allEvents) {
-    const contactId = ev.contactId;
-    if (!contactId) continue;
-    if (!byContact.has(contactId)) byContact.set(contactId, { dropoffs: [], pickups: [] });
-    const bucket = byContact.get(contactId);
-    if (DROPOFF_CALENDAR_IDS.has(ev._calendarId)) bucket.dropoffs.push(ev);
-    else if (PICKUP_CALENDAR_IDS.has(ev._calendarId)) bucket.pickups.push(ev);
+  // Step 2: sort by start time so pairing is deterministic
+  allAppointments.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+  // Step 3: group into stays by contactId + service_type + proximity
+  const stays = []; // { dropoff, pickup, contactId, serviceType }
+
+  for (const appt of allAppointments) {
+    const calMeta = CALENDAR_LOOKUP[appt.calendarId];
+    if (!calMeta) continue; // not one of our tracked calendars
+
+    const { serviceType, role } = calMeta;
+    const isDropoff = role === 'dropoff';
+    const isPickup  = role === 'pickup';
+
+    const contactId = appt.contactId;
+    const apptTime  = new Date(appt.startTime).getTime();
+    const windowMs  = CONFIG.PAIRING_WINDOW_HOURS * 3600 * 1000;
+
+    // Try to find an existing incomplete stay for this contact + service type within the window
+    let matched = null;
+    for (const stay of stays) {
+      if (stay.contactId !== contactId) continue;
+      if (stay.serviceType !== serviceType) continue; // never cross-pair different services
+      const refTime = stay.dropoff
+        ? new Date(stay.dropoff.startTime).getTime()
+        : new Date(stay.pickup.startTime).getTime();
+
+      if (Math.abs(apptTime - refTime) <= windowMs * 20) { // wider tolerance: stays can span days
+        if (isDropoff && !stay.dropoff) { matched = stay; break; }
+        if (isPickup  && !stay.pickup)  { matched = stay; break; }
+      }
+    }
+
+    if (matched) {
+      if (isDropoff) matched.dropoff = appt;
+      if (isPickup)  matched.pickup  = appt;
+    } else {
+      stays.push({
+        contactId,
+        serviceType,
+        dropoff: isDropoff ? appt : null,
+        pickup:  isPickup  ? appt : null,
+      });
+    }
   }
 
-  console.log(`\nGrouped appointments for ${byContact.size} contacts. Pairing...\n`);
+  console.log(`Grouped into ${stays.length} stay(s)\n`);
 
-  let created = 0, paired = 0, incomplete = 0, skipped = 0, failed = 0;
+  // Step 4: insert/upsert into Supabase
+  let created = 0, updated = 0, incomplete = 0, errors = 0;
 
-  // 3. For each contact, pair drop-offs with the nearest unmatched pick-up
-  for (const [contactId, { dropoffs, pickups }] of byContact) {
-    const usedPickups = new Set();
+  for (const stay of stays) {
+    const { dropoff, pickup, contactId, serviceType } = stay;
     const contact = await getContact(contactId);
 
-    for (const dropoff of dropoffs) {
-      const dropoffTime = new Date(dropoff.startTime).getTime();
+    const dropoffMeta = dropoff ? CALENDAR_LOOKUP[dropoff.calendarId] : null;
+    const pickupMeta  = pickup  ? CALENDAR_LOOKUP[pickup.calendarId]  : null;
+    const source = (dropoffMeta?.source === 'online' || pickupMeta?.source === 'online') ? 'online' : 'internal';
 
-      // Find nearest pickup after this dropoff, within the pairing window, not already used
-      let bestPickup = null;
-      let bestDiff = Infinity;
-      for (const pickup of pickups) {
-        if (usedPickups.has(pickup.id)) continue;
-        const pickupTime = new Date(pickup.startTime).getTime();
-        const diff = pickupTime - dropoffTime;
-        if (diff < 0) continue; // pickup must come after dropoff
-        if (diff > CONFIG.PAIRING_WINDOW_HOURS * 60 * 60 * 1000) continue;
-        if (diff < bestDiff) { bestDiff = diff; bestPickup = pickup; }
-      }
-      if (bestPickup) usedPickups.add(bestPickup.id);
+    // Determine status — for backfill, assume confirmed unless we can detect otherwise
+    let status = 'confirmed';
+    if (!dropoff || !pickup) status = 'incomplete';
+    if (dropoff?.appointmentStatus === 'cancelled' || pickup?.appointmentStatus === 'cancelled') status = 'cancelled';
 
-      const source = (dropoff._calendarId === CONFIG.CALENDARS.DROPOFF_ONLINE) ? 'online' : 'internal';
-      const status = bestPickup ? 'completed_or_active' : 'incomplete'; // resolved below
+    // Timezone-aware "today" comparison — compares calendar dates in the
+    // business timezone, not raw UTC instants, so a stay starting today
+    // doesn't get misclassified due to UTC offset.
+    const todayStr = getDateStringInTZ(new Date(), CONFIG.TIMEZONE);
+    const startDate = dropoff?.startTime ? new Date(dropoff.startTime) : null;
+    const endDate   = pickup?.startTime  ? new Date(pickup.startTime)  : null;
+    const startStr  = startDate ? getDateStringInTZ(startDate, CONFIG.TIMEZONE) : null;
+    const endStr    = endDate   ? getDateStringInTZ(endDate, CONFIG.TIMEZONE)   : null;
 
-      try {
-        const result = await upsertStay({
-          contactId,
-          contact,
-          dropoff,
-          pickup: bestPickup,
-          source,
-        });
-        if (result === 'incomplete') incomplete++;
-        else if (bestPickup) paired++;
-        else created++;
-      } catch (err) {
-        console.error(`Failed to upsert stay for contact ${contactId}:`, err.message);
-        failed++;
-      }
+    if (status === 'confirmed' && startStr && endStr) {
+      if (startStr <= todayStr && endStr >= todayStr) status = 'active';
+      else if (endStr < todayStr) status = 'completed';
     }
 
-    // Any leftover pickups with no matching dropoff become incomplete records too
-    for (const pickup of pickups) {
-      if (usedPickups.has(pickup.id)) continue;
-      const source = (pickup._calendarId === CONFIG.CALENDARS.PICKUP_ONLINE) ? 'online' : 'internal';
-      try {
-        await upsertStay({ contactId, contact, dropoff: null, pickup, source });
-        incomplete++;
-      } catch (err) {
-        console.error(`Failed to upsert orphan pickup for contact ${contactId}:`, err.message);
-        failed++;
+    const payload = {
+      ghl_dropoff_appointment_id: dropoff?.id || null,
+      ghl_pickup_appointment_id:  pickup?.id  || null,
+      dropoff_calendar_id: dropoff?.calendarId || null,
+      pickup_calendar_id:  pickup?.calendarId  || null,
+      contact_id:   contactId,
+      owner_name:   contact?.name  || contact?.firstName || null,
+      owner_email:  contact?.email || null,
+      owner_phone:  contact?.phone || null,
+      dog_name:     null, // not reliably available from appointment data — can be backfilled later from custom fields
+      start_date:   dropoff?.startTime || null,
+      end_date:     pickup?.startTime  || null,
+      source,
+      service_type: serviceType,
+      status,
+      is_returning_client: false, // can't reliably determine in backfill; will self-correct on next booking
+      last_modified_source: 'ghl',
+      last_synced_at: new Date().toISOString(),
+    };
+
+    try {
+      // Check if this stay already exists (by either appointment ID)
+      let existing = null;
+      if (payload.ghl_dropoff_appointment_id) {
+        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_dropoff_appointment_id', payload.ghl_dropoff_appointment_id).limit(1);
+        if (data && data.length) existing = data[0];
       }
+      if (!existing && payload.ghl_pickup_appointment_id) {
+        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_pickup_appointment_id', payload.ghl_pickup_appointment_id).limit(1);
+        if (data && data.length) existing = data[0];
+      }
+
+      if (existing) {
+        await supabase.from('boarding_stays').update(payload).eq('id', existing.id);
+        updated++;
+      } else {
+        await supabase.from('boarding_stays').insert(payload);
+        created++;
+      }
+
+      if (status === 'incomplete') incomplete++;
+
+      console.log(`  ✓ ${contact?.name || contactId} — ${payload.start_date ? new Date(payload.start_date).toDateString() : '?'} -> ${payload.end_date ? new Date(payload.end_date).toDateString() : '?'} [${status}]`);
+    } catch (err) {
+      errors++;
+      console.error(`  ✗ Failed for contact ${contactId}:`, err.message);
     }
   }
 
-  console.log(`\nBackfill complete.`);
-  console.log(`  Paired (dropoff+pickup): ${paired}`);
-  console.log(`  Incomplete (missing half): ${incomplete}`);
-  console.log(`  Skipped: ${skipped}`);
-  console.log(`  Failed: ${failed}`);
+  console.log(`\n========================================`);
+  console.log(`Backfill complete.`);
+  console.log(`  Created:    ${created}`);
+  console.log(`  Updated:    ${updated}`);
+  console.log(`  Incomplete: ${incomplete} (missing drop off or pick up)`);
+  console.log(`  Errors:     ${errors}`);
+  console.log(`========================================`);
 }
 
-// ------------------------------------------------------------
-// UPSERT A STAY INTO boarding_stays
-// Determines real status from today's date once both ends known
-// ------------------------------------------------------------
-async function upsertStay({ contactId, contact, dropoff, pickup, source }) {
-  const today = new Date();
-  const startDate = dropoff ? dropoff.startTime : null;
-  const endDate   = pickup  ? pickup.startTime  : null;
-
-  let status = 'incomplete';
-  if (startDate && endDate) {
-    const start = new Date(startDate);
-    const end   = new Date(endDate);
-    if (end < today) status = 'completed';
-    else if (start <= today && end >= today) status = 'active';
-    else status = 'confirmed';
-  }
-
-  const payload = {
-    contact_id:   contactId,
-    owner_name:   contact?.name  || null,
-    owner_email:  contact?.email || null,
-    owner_phone:  contact?.phone || null,
-    dog_name:     extractDogName(contact, dogNameFieldId),
-    source,
-    status,
-    start_date: startDate,
-    end_date:   endDate,
-    ghl_dropoff_appointment_id: dropoff?.id || null,
-    ghl_pickup_appointment_id:  pickup?.id  || null,
-    dropoff_calendar_id: dropoff?._calendarId || null,
-    pickup_calendar_id:  pickup?._calendarId  || null,
-    last_modified_source: 'ghl',
-    last_synced_at: new Date().toISOString(),
-    is_returning_client: false, // self-corrects as live bookings come through
-  };
-
-  // Check if a stay already exists for either appointment ID — upsert, don't duplicate
-  const orFilters = [];
-  if (dropoff?.id) orFilters.push(`ghl_dropoff_appointment_id.eq.${dropoff.id}`);
-  if (pickup?.id)  orFilters.push(`ghl_pickup_appointment_id.eq.${pickup.id}`);
-
-  let existing = null;
-  if (orFilters.length > 0) {
-    const { data } = await supabase
-      .from('boarding_stays')
-      .select('id')
-      .or(orFilters.join(','))
-      .limit(1);
-    existing = data && data.length > 0 ? data[0] : null;
-  }
-
-  if (existing) {
-    const { error } = await supabase.from('boarding_stays').update(payload).eq('id', existing.id);
-    if (error) throw error;
-    console.log(`  Updated stay ${existing.id} — ${payload.owner_name || 'Unknown'} (${status})`);
-  } else {
-    const { data, error } = await supabase.from('boarding_stays').insert(payload).select().single();
-    if (error) throw error;
-    console.log(`  Created stay ${data.id} — ${payload.owner_name || 'Unknown'} (${status})`);
-  }
-
-  return status;
-}
-
-run().then(() => {
-  console.log('\nDone.');
-  process.exit(0);
-}).catch(err => {
+backfill().catch(err => {
   console.error('Backfill failed:', err);
   process.exit(1);
 });
