@@ -501,9 +501,9 @@ app.get('/api/dashboard/today', async (req, res) => {
     //
     // IMPORTANT: only exclude 'cancelled' here, not 'incomplete'.
     // A stay can be 'incomplete' (missing its pickup pairing) while
-    // still having a real dropoff appointment today — that dog is
-    // still arriving and staff still need to see it on the dashboard.
-    // 'active' (below) still correctly requires both dates to be set.
+    // still having a real dropoff appointment — that dog may be
+    // arriving today, or already in-house with no pickup booked yet.
+    // Both arrivals and active-stay calculations below account for this.
     const { data: allStays } = await supabase
       .from('boarding_stays')
       .select('*')
@@ -511,11 +511,21 @@ app.get('/api/dashboard/today', async (req, res) => {
 
     const arrivals   = (allStays || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === todayStr);
     const departures = (allStays || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === todayStr);
-    const active      = (allStays || []).filter(s => {
-      if (!s.start_date || !s.end_date) return false;
+
+    // A dog counts as "active" (in-house right now) if it has dropped off
+    // on or before today AND either:
+    //   (a) has no pickup scheduled yet (still here, pickup not synced/booked), or
+    //   (b) its scheduled pickup is today or later.
+    // Previously this required BOTH start_date and end_date to be set,
+    // which silently hid every dog with an unmatched/missing pickup —
+    // exactly the dogs staff most need visibility into.
+    const active = (allStays || []).filter(s => {
+      if (!s.start_date) return false;
       const startStr = getDateStringInTZ(new Date(s.start_date));
-      const endStr   = getDateStringInTZ(new Date(s.end_date));
-      return startStr <= todayStr && endStr >= todayStr;
+      if (startStr > todayStr) return false; // hasn't arrived yet
+      if (!s.end_date) return true;          // arrived, no pickup booked yet -> still active
+      const endStr = getDateStringInTZ(new Date(s.end_date));
+      return endStr >= todayStr;             // arrived, pickup is today or later -> still active
     });
 
     const [pendingRes, incompleteRes] = await Promise.all([
