@@ -17,6 +17,20 @@ const app = express();
 app.use(express.json());
 
 // ------------------------------------------------------------
+// CORS — allow the portal (hosted anywhere, including file://)
+// to call this API. Since this is an internal staff tool behind
+// PIN auth, we allow all origins rather than maintaining an
+// allowlist of hosting URLs.
+// ------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ------------------------------------------------------------
 // CONFIG — set these in your .env file
 // ------------------------------------------------------------
 const CONFIG = {
@@ -384,31 +398,55 @@ app.get('/api/stays', async (req, res) => {
 });
 
 // GET today's dashboard summary
+// Timezone-aware date string helper (matches business location: Savannah, GA = America/New_York)
+const BUSINESS_TIMEZONE = 'America/New_York';
+function getDateStringInTZ(date, timeZone = BUSINESS_TIMEZONE) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  return formatter.format(date); // YYYY-MM-DD
+}
+
 app.get('/api/dashboard/today', async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0];
-    const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+    const now = new Date();
+    const todayStr    = getDateStringInTZ(now);
+    const tomorrowStr = getDateStringInTZ(new Date(now.getTime() + 86400000));
 
-    const [arrivals, departures, active, pending, incomplete] = await Promise.all([
-      supabase.from('boarding_stays').select('*').gte('start_date', today).lt('start_date', tomorrow).not('status', 'in', '("cancelled","incomplete")'),
-      supabase.from('boarding_stays').select('*').gte('end_date', today).lt('end_date', tomorrow).not('status', 'in', '("cancelled","incomplete")'),
-      supabase.from('boarding_stays').select('*').lte('start_date', new Date().toISOString()).gte('end_date', new Date().toISOString()).not('status', 'in', '("cancelled","incomplete")'),
+    // Pull a window of candidates, then filter precisely in JS using
+    // timezone-aware date comparison (Postgres date range queries on
+    // raw timestamps would hit the same UTC-boundary bug).
+    const { data: allActive } = await supabase
+      .from('boarding_stays')
+      .select('*')
+      .not('status', 'in', '("cancelled","incomplete")');
+
+    const arrivals   = (allActive || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === todayStr);
+    const departures = (allActive || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === todayStr);
+    const active      = (allActive || []).filter(s => {
+      if (!s.start_date || !s.end_date) return false;
+      const startStr = getDateStringInTZ(new Date(s.start_date));
+      const endStr   = getDateStringInTZ(new Date(s.end_date));
+      return startStr <= todayStr && endStr >= todayStr;
+    });
+
+    const [pendingRes, incompleteRes] = await Promise.all([
       supabase.from('boarding_stays').select('*').eq('status', 'requested'),
       supabase.from('boarding_stays').select('*').eq('status', 'incomplete'),
     ]);
 
     res.json({
-      arrivals:   arrivals.data   || [],
-      departures: departures.data || [],
-      active:     active.data     || [],
-      pending:    pending.data    || [],
-      incomplete: incomplete.data || [],
+      arrivals,
+      departures,
+      active,
+      pending:    pendingRes.data    || [],
+      incomplete: incompleteRes.data || [],
       counts: {
-        arrivals:   arrivals.data?.length   || 0,
-        departures: departures.data?.length || 0,
-        active:     active.data?.length     || 0,
-        pending:    pending.data?.length    || 0,
-        incomplete: incomplete.data?.length || 0,
+        arrivals:   arrivals.length,
+        departures: departures.length,
+        active:     active.length,
+        pending:    pendingRes.data?.length    || 0,
+        incomplete: incompleteRes.data?.length || 0,
       },
     });
   } catch (err) {
