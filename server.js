@@ -26,12 +26,12 @@ const CONFIG = {
   PORT:           process.env.PORT || 3000,
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  // optional: set in GHL webhook config
 
-  // Calendar IDs — confirm exact mapping from GHL Settings → Calendars
+  // Calendar IDs — confirmed against GHL Settings → Calendars
   CALENDARS: {
-    DROPOFF_INPERSON: '1FnbK7pQp1ViZWIzX95R',   // Boarding Drop Off
+    DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
     DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
-    PICKUP_INPERSON:  'bN6wWGJa0qKq0QGRg4CC',   // Boarding Pick Up - Online (confirm)
-    PICKUP_ONLINE:    'w55N8WN4BbzznaLjEg1N',    // Boarding Drop Off (confirm)
+    PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
+    PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
   },
 
   // Window in hours within which two appointments are considered part of the same booking
