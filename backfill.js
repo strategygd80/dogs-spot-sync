@@ -91,13 +91,56 @@ async function fetchCalendarEvents(calendarId, startMs, endMs) {
 // ------------------------------------------------------------
 // GET CONTACT DETAILS (name/email/phone)
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// CUSTOM FIELD LOOKUP — "Dog's Name" is stored as a contact
+// custom field in GHL, not in the appointment title.
+// ------------------------------------------------------------
+let dogNameFieldId = null;
+async function resolveDogNameFieldId() {
+  if (dogNameFieldId) return dogNameFieldId;
+  try {
+    const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
+    const fields = res.data?.customFields || [];
+    const match = fields.find(f =>
+      (f.name || '').toLowerCase().includes("dog") &&
+      (f.name || '').toLowerCase().includes("name")
+    );
+    if (match) {
+      dogNameFieldId = match.id;
+      console.log(`Found "Dog's Name" custom field: ${match.name} (${match.id})`);
+    } else {
+      console.warn('Could not find a custom field matching "Dog\'s Name" — dog names will be blank. Check field name in GHL.');
+    }
+  } catch (err) {
+    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
+  }
+  return dogNameFieldId;
+}
+
+function extractDogName(contact, fieldId) {
+  if (!contact || !fieldId || !Array.isArray(contact.customFields)) return null;
+  const field = contact.customFields.find(f => f.id === fieldId);
+  return field?.value || field?.fieldValue || null;
+}
+
 const contactCache = new Map();
 async function getContact(contactId) {
   if (!contactId) return null;
   if (contactCache.has(contactId)) return contactCache.get(contactId);
   try {
     const res = await ghl.get(`/contacts/${contactId}`);
-    const contact = res.data?.contact || null;
+    const raw = res.data?.contact || null;
+    if (!raw) { contactCache.set(contactId, null); return null; }
+
+    // GHL doesn't reliably return a flat "name" field — build one from parts
+    const fullName =
+      raw.name ||
+      raw.contactName ||
+      [raw.firstName, raw.lastName].filter(Boolean).join(' ').trim() ||
+      raw.email ||
+      null;
+
+    const contact = { ...raw, name: fullName };
     contactCache.set(contactId, contact);
     return contact;
   } catch (err) {
@@ -110,6 +153,8 @@ async function getContact(contactId) {
 // MAIN BACKFILL
 // ------------------------------------------------------------
 async function run() {
+  await resolveDogNameFieldId();
+
   const now = Date.now();
   const startMs = now - CONFIG.LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
   const endMs   = now + CONFIG.LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000;
@@ -230,6 +275,7 @@ async function upsertStay({ contactId, contact, dropoff, pickup, source }) {
     owner_name:   contact?.name  || null,
     owner_email:  contact?.email || null,
     owner_phone:  contact?.phone || null,
+    dog_name:     extractDogName(contact, dogNameFieldId),
     source,
     status,
     start_date: startDate,
