@@ -271,7 +271,7 @@ async function processAppointment(payload, eventType) {
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
       // Fill contact info if missing
-      owner_name:  pairableStay.owner_name  || contact?.name  || null,
+      owner_name:  pairableStay.owner_name  || contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
     };
@@ -285,7 +285,7 @@ async function processAppointment(payload, eventType) {
 
     const insertPayload = {
       contact_id:   contactId,
-      owner_name:   contact?.name  || null,
+      owner_name:   contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
       source,
