@@ -174,6 +174,42 @@ async function getContactAppointments(contactId) {
   return res.data?.appointments || [];
 }
 
+// ------------------------------------------------------------
+// CUSTOM FIELD DISCOVERY — DOG NAME
+// GHL stores "Dog's Name" as a custom field on the contact, keyed
+// by field ID inside contact.customFields. We fetch the account's
+// custom field definitions once at startup, find the one that
+// looks like a dog-name field, and use that ID going forward.
+// ------------------------------------------------------------
+let DOG_NAME_FIELD_ID = null;
+async function discoverDogNameFieldId() {
+  try {
+    const res = await ghl.get('/custom-fields/');
+    const fields = res.data?.customFields || [];
+    const match = fields.find(f =>
+      /dog.?s?.?name/i.test(f.name || '') || /dog.?s?.?name/i.test(f.fieldKey || '')
+    );
+    if (match) {
+      DOG_NAME_FIELD_ID = match.id;
+      console.log(`Found dog name custom field: "${match.name}" -> id ${match.id}`);
+    } else {
+      console.warn('WARNING: Could not find a custom field matching "dog name". Dog names will not sync from GHL.');
+    }
+  } catch (err) {
+    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
+  }
+}
+
+function resolveDogName(contact) {
+  if (!contact || !DOG_NAME_FIELD_ID) return null;
+  const customFields = contact.customFields || contact.customField || [];
+  const entry = Array.isArray(customFields)
+    ? customFields.find(f => f.id === DOG_NAME_FIELD_ID)
+    : null;
+  const value = entry?.value || entry?.fieldValue || null;
+  return value && String(value).trim() ? String(value).trim() : null;
+}
+
 async function getContact(contactId) {
   const res = await ghl.get(`/contacts/${contactId}`);
   return res.data?.contact || null;
@@ -329,6 +365,7 @@ async function processAppointment(payload, eventType) {
       owner_name:  pairableStay.owner_name  || resolveOwnerName(contact),
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
+      dog_name:    pairableStay.dog_name    || resolveDogName(contact),
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
@@ -343,6 +380,7 @@ async function processAppointment(payload, eventType) {
       owner_name:   resolveOwnerName(contact),
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
+      dog_name:     resolveDogName(contact),
       source,
       service_type: serviceType,
       status: 'incomplete',
@@ -756,8 +794,10 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().
 // ------------------------------------------------------------
 // START
 // ------------------------------------------------------------
-app.listen(CONFIG.PORT, () => {
-  console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
-  console.log(`Webhook endpoint: POST /webhook/ghl`);
-  console.log(`API base: GET/PATCH /api/stays`);
+discoverDogNameFieldId().finally(() => {
+  app.listen(CONFIG.PORT, () => {
+    console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
+    console.log(`Webhook endpoint: POST /webhook/ghl`);
+    console.log(`API base: GET/PATCH /api/stays`);
+  });
 });
