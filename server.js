@@ -84,7 +84,39 @@ async function getContactAppointments(contactId) {
 
 async function getContact(contactId) {
   const res = await ghl.get(`/contacts/${contactId}`);
-  return res.data?.contact || null;
+  const raw = res.data?.contact || null;
+  if (!raw) return null;
+  const fullName =
+    raw.name ||
+    raw.contactName ||
+    [raw.firstName, raw.lastName].filter(Boolean).join(' ').trim() ||
+    raw.email ||
+    null;
+  return { ...raw, name: fullName };
+}
+
+// "Dog's Name" is a contact custom field in GHL, resolved once and cached
+let dogNameFieldId = null;
+async function resolveDogNameFieldId() {
+  if (dogNameFieldId) return dogNameFieldId;
+  try {
+    const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
+    const fields = res.data?.customFields || [];
+    const match = fields.find(f =>
+      (f.name || '').toLowerCase().includes("dog") &&
+      (f.name || '').toLowerCase().includes("name")
+    );
+    if (match) dogNameFieldId = match.id;
+  } catch (err) {
+    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
+  }
+  return dogNameFieldId;
+}
+
+function extractDogName(contact) {
+  if (!contact || !dogNameFieldId || !Array.isArray(contact.customFields)) return null;
+  const field = contact.customFields.find(f => f.id === dogNameFieldId);
+  return field?.value || field?.fieldValue || null;
 }
 
 // ------------------------------------------------------------
@@ -230,6 +262,7 @@ async function processAppointment(payload, eventType) {
       owner_name:  pairableStay.owner_name  || contact?.name  || null,
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
+      dog_name:    pairableStay.dog_name    || extractDogName(contact),
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
@@ -244,6 +277,7 @@ async function processAppointment(payload, eventType) {
       owner_name:   contact?.name  || null,
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
+      dog_name:     extractDogName(contact),
       source,
       status: 'incomplete',
       last_modified_source: 'ghl',
@@ -559,4 +593,8 @@ app.listen(CONFIG.PORT, () => {
   console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
   console.log(`Webhook endpoint: POST /webhook/ghl`);
   console.log(`API base: GET/PATCH /api/stays`);
+  resolveDogNameFieldId().then(id => {
+    if (id) console.log(`Resolved "Dog's Name" custom field ID: ${id}`);
+    else console.warn(`Could not resolve "Dog's Name" custom field — dog names won't sync until this is fixed.`);
+  });
 });
