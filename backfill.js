@@ -294,7 +294,7 @@ async function backfill() {
       dropoff_calendar_id: dropoff?.calendarId || null,
       pickup_calendar_id:  pickup?.calendarId  || null,
       contact_id:   contactId,
-      owner_name:   contact?.name  || contact?.firstName || null,
+      owner_name:   contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
       dog_name:     null, // not reliably available from appointment data — can be backfilled later from custom fields
