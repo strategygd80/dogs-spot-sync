@@ -101,15 +101,23 @@ async function resolveDogNameFieldId() {
   try {
     const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
     const fields = res.data?.customFields || [];
-    const match = fields.find(f =>
-      (f.name || '').toLowerCase().includes("dog") &&
-      (f.name || '').toLowerCase().includes("name")
-    );
+
+    // Prefer exact match on the merge-field key (contact.dogs_name)
+    let match = fields.find(f => (f.fieldKey || '').toLowerCase() === 'contact.dogs_name');
+
+    // Fallback: loose match on the field's display name
+    if (!match) {
+      match = fields.find(f =>
+        (f.name || '').toLowerCase().includes("dog") &&
+        (f.name || '').toLowerCase().includes("name")
+      );
+    }
+
     if (match) {
       dogNameFieldId = match.id;
-      console.log(`Found "Dog's Name" custom field: ${match.name} (${match.id})`);
+      console.log(`Found "Dog's Name" custom field: ${match.name} (${match.id}, key: ${match.fieldKey})`);
     } else {
-      console.warn('Could not find a custom field matching "Dog\'s Name" — dog names will be blank. Check field name in GHL.');
+      console.warn('Could not find a custom field with key "contact.dogs_name" — dog names will be blank. Check field setup in GHL.');
     }
   } catch (err) {
     console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
