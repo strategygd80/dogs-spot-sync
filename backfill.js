@@ -113,6 +113,26 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 
 const ALL_CALENDAR_IDS = Object.keys(CALENDAR_LOOKUP);
 
+// ------------------------------------------------------------
+// PAIRING GROUPS
+// 'boarding' only pairs dropoff<->pickup within itself.
+// The other five service types share one pool: a dropoff on any
+// of them can pair with a pickup on any other (e.g. drop off as
+// Basic, pick up as Bundle). Each service type maps to a group ID;
+// only appointments in the same group are eligible to pair.
+// ------------------------------------------------------------
+const PAIRING_GROUPS = {
+  boarding:    'boarding',
+  basic:       'flexible',
+  bundle:      'flexible',
+  leash_free:  'flexible',
+  service_dog: 'flexible',
+  community:   'flexible',
+};
+function pairingGroupOf(serviceType) {
+  return PAIRING_GROUPS[serviceType] || serviceType; // fall back to isolated pairing if unmapped
+}
+
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 
 // ------------------------------------------------------------
@@ -206,42 +226,48 @@ async function backfill() {
   // Step 2: sort by start time so pairing is deterministic
   allAppointments.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
-  // Step 3: group into stays by contactId + service_type + proximity
+  // Step 3: group into stays by contactId + pairing_group + proximity
   //
   // Pairing rules (fixed):
   //   1. A pickup may only pair with a dropoff that happened at or before it.
   //      This stops a pickup from accidentally pairing with a *later*
   //      dropoff and producing end_date < start_date rows.
-  //   2. Among all open, eligible stays for a contact+serviceType, pick the
+  //   2. Among all open, eligible stays for a contact+pairingGroup, pick the
   //      CLOSEST one in time, not the first one encountered in array order.
   //      This matters for repeat/back-to-back boarders.
   //   3. Max span between dropoff and pickup is capped (see MAX_STAY_DAYS)
   //      so we don't pair a dropoff with some unrelated pickup weeks later
   //      just because the contact had no other open stay.
+  //   4. Matching is by PAIRING GROUP, not exact service type: 'boarding' is
+  //      its own isolated group, while basic/bundle/leash_free/service_dog/
+  //      community all share one 'flexible' group (drop off as one, pick up
+  //      as another). The stay's recorded service_type is whichever leg
+  //      arrives first (dropoff's type, or pickup's type if no dropoff).
   const MAX_STAY_DAYS = 30; // generous ceiling for a single boarding stay
   const maxSpanMs = MAX_STAY_DAYS * 86400000;
 
-  const stays = []; // { dropoff, pickup, contactId, serviceType }
+  const stays = []; // { dropoff, pickup, contactId, serviceType, pairingGroup }
 
   for (const appt of allAppointments) {
     const calMeta = CALENDAR_LOOKUP[appt.calendarId];
     if (!calMeta) continue; // not one of our tracked calendars
 
     const { serviceType, role } = calMeta;
+    const pairingGroup = pairingGroupOf(serviceType);
     const isDropoff = role === 'dropoff';
     const isPickup  = role === 'pickup';
 
     const contactId = appt.contactId;
     const apptTime  = new Date(appt.startTime).getTime();
 
-    // Collect every open, eligible stay for this contact + service type,
+    // Collect every open, eligible stay for this contact + pairing group,
     // then choose the closest in time rather than the first match found.
     let best = null;
     let bestDelta = Infinity;
 
     for (const stay of stays) {
       if (stay.contactId !== contactId) continue;
-      if (stay.serviceType !== serviceType) continue; // never cross-pair different services
+      if (stay.pairingGroup !== pairingGroup) continue; // never cross-pair different groups
 
       if (isDropoff && !stay.dropoff && stay.pickup) {
         // Filling in a missing dropoff for a stay that already has a pickup.
@@ -270,10 +296,14 @@ async function backfill() {
     if (best) {
       if (isDropoff) best.dropoff = appt;
       if (isPickup)  best.pickup  = appt;
+      // Recorded service_type reflects whichever leg represents arrival
+      // (the dropoff), since that's when the dog actually entered care.
+      if (isDropoff) best.serviceType = serviceType;
     } else {
       stays.push({
         contactId,
         serviceType,
+        pairingGroup,
         dropoff: isDropoff ? appt : null,
         pickup:  isPickup  ? appt : null,
       });
