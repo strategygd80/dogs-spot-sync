@@ -97,6 +97,30 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 }
 
 // ------------------------------------------------------------
+// PAIRING GROUPS
+// 'boarding' only pairs dropoff<->pickup within itself.
+// The other five service types share one pool: a dropoff on any
+// of them can pair with a pickup on any other (e.g. drop off as
+// Basic, pick up as Bundle). Each service type maps to a group ID;
+// only appointments in the same group are eligible to pair.
+// ------------------------------------------------------------
+const PAIRING_GROUPS = {
+  boarding:    'boarding',
+  basic:       'flexible',
+  bundle:      'flexible',
+  leash_free:  'flexible',
+  service_dog: 'flexible',
+  community:   'flexible',
+};
+function pairingGroupOf(serviceType) {
+  return PAIRING_GROUPS[serviceType] || serviceType; // fall back to isolated pairing if unmapped
+}
+function serviceTypesInGroup(serviceType) {
+  const group = pairingGroupOf(serviceType);
+  return Object.keys(PAIRING_GROUPS).filter(st => PAIRING_GROUPS[st] === group);
+}
+
+// ------------------------------------------------------------
 // NAME RESOLUTION
 // GHL's contact API can return name fields under different keys
 // depending on account/version. Rather than guessing one key,
@@ -183,12 +207,17 @@ async function findPairableStay(contactId, appointmentCreatedAt, role, serviceTy
   const windowEnd = new Date(appointmentCreatedAt);
   windowEnd.setHours(windowEnd.getHours() + CONFIG.PAIRING_WINDOW_HOURS);
 
+  // Match against every service type in the same pairing group, not just
+  // an exact serviceType match. 'boarding' only matches 'boarding'; the
+  // other five service types are interchangeable with each other.
+  const eligibleTypes = serviceTypesInGroup(serviceType);
+
   const { data, error } = await supabase
     .from('boarding_stays')
     .select('*')
     .eq('contact_id', contactId)
     .eq('status', 'incomplete')
-    .eq('service_type', serviceType)
+    .in('service_type', eligibleTypes)
     .gte('created_at', windowStart.toISOString())
     .lte('created_at', windowEnd.toISOString())
     // Only pair if the other half is missing
@@ -287,7 +316,11 @@ async function processAppointment(payload, eventType) {
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
       source,
-      service_type: serviceType,
+      // service_type reflects the dropoff leg (when the dog actually
+      // arrived), not whichever leg happens to sync last. If this
+      // appointment is a pickup completing a cross-paired stay (e.g.
+      // dropped off as Basic, picked up as Bundle), keep the original.
+      service_type: role === 'dropoff' ? serviceType : pairableStay.service_type,
       status: pairableStay.status === 'incomplete' ? status : pairableStay.status,
       is_returning_client: status === 'confirmed' && source === 'online',
       last_modified_source: 'ghl',
