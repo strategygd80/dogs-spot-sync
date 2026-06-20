@@ -102,10 +102,13 @@ async function resolveDogNameFieldId() {
   try {
     const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
     const fields = res.data?.customFields || [];
-    const match = fields.find(f =>
-      (f.name || '').toLowerCase().includes("dog") &&
-      (f.name || '').toLowerCase().includes("name")
-    );
+    let match = fields.find(f => (f.fieldKey || '').toLowerCase() === 'contact.dogs_name');
+    if (!match) {
+      match = fields.find(f =>
+        (f.name || '').toLowerCase().includes("dog") &&
+        (f.name || '').toLowerCase().includes("name")
+      );
+    }
     if (match) dogNameFieldId = match.id;
   } catch (err) {
     console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
