@@ -185,48 +185,30 @@ async function fetchAppointmentsForCalendar(calendarId) {
 }
 
 // ------------------------------------------------------------
-// CUSTOM FIELD DISCOVERY — DOG NAME
-// GHL stores "Dog's Name" as a custom field on the contact, keyed
-// by field ID inside contact.customFields, e.g.:
-//   contact.customFields = [{ id: 'abc123', value: 'Rex' }, ...]
-// We don't know the field ID ahead of time, so we fetch the
-// account's custom field definitions once, find the one whose
-// name/fieldKey looks like a dog-name field, and use that ID to
-// pull the value off each contact going forward.
+// CUSTOM FIELD — DOG NAME
+// Confirmed via direct lookup on a real contact (Scott Davenport,
+// dog "Val") that GHL stores the dog's name under TWO custom field
+// IDs that both held the same value for him:
+//   MNwzpEaxKwgifkOsvhIb  (likely "Dog's Name")
+//   9m5zqCls4pQFTdlJJZaI  (unconfirmed label, also held "Val")
+// Rather than gamble on picking one, we check both and use whichever
+// is non-empty — preferring the first if both are populated. If a
+// contact ever has genuinely different values in these two fields,
+// the first one wins; flag that contact for manual review if seen.
 // ------------------------------------------------------------
-let DOG_NAME_FIELD_ID = null;
-let _customFieldsChecked = false;
-
-async function discoverDogNameFieldId() {
-  if (_customFieldsChecked) return DOG_NAME_FIELD_ID;
-  _customFieldsChecked = true;
-  try {
-    const res = await ghl.get('/custom-fields/');
-    const fields = res.data?.customFields || [];
-    const match = fields.find(f =>
-      /dog.?s?.?name/i.test(f.name || '') || /dog.?s?.?name/i.test(f.fieldKey || '')
-    );
-    if (match) {
-      DOG_NAME_FIELD_ID = match.id;
-      console.log(`Found dog name custom field: "${match.name}" (${match.fieldKey}) -> id ${match.id}`);
-    } else {
-      console.warn('WARNING: Could not find a custom field matching "dog name". Dog names will not be backfilled. Available custom fields:');
-      fields.forEach(f => console.warn(`  - ${f.name} (${f.fieldKey})`));
-    }
-  } catch (err) {
-    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
-  }
-  return DOG_NAME_FIELD_ID;
-}
+const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 
 function resolveDogName(contact) {
-  if (!contact || !DOG_NAME_FIELD_ID) return null;
+  if (!contact) return null;
   const customFields = contact.customFields || contact.customField || [];
-  const entry = Array.isArray(customFields)
-    ? customFields.find(f => f.id === DOG_NAME_FIELD_ID)
-    : null;
-  const value = entry?.value || entry?.fieldValue || null;
-  return value && String(value).trim() ? String(value).trim() : null;
+  if (!Array.isArray(customFields)) return null;
+
+  for (const fieldId of DOG_NAME_FIELD_IDS) {
+    const entry = customFields.find(f => f.id === fieldId);
+    const value = entry?.value || entry?.fieldValue || null;
+    if (value && String(value).trim()) return String(value).trim();
+  }
+  return null;
 }
 
 // ------------------------------------------------------------
@@ -251,8 +233,6 @@ async function getContact(contactId) {
 // ------------------------------------------------------------
 async function backfill() {
   console.log(DRY_RUN ? 'Starting backfill (DRY RUN — no writes to Supabase)...\n' : 'Starting backfill...\n');
-
-  await discoverDogNameFieldId();
 
   // Step 1: pull all appointments from all four calendars
   let allAppointments = [];
