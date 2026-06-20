@@ -318,7 +318,7 @@ async function main() {
   const { error: deleteError, count } = await supabase
     .from('boarding_stays')
     .delete({ count: 'exact' })
-    .neq('contact_id', 'KEEP_NOTHING'); // Supabase requires a filter; this matches all rows
+    .gte('created_at', '2000-01-01'); // always-true filter — matches every row
 
   if (deleteError) {
     console.error('Failed to delete existing rows:', deleteError.message);
@@ -343,7 +343,7 @@ async function main() {
       return {
         ghl_dropoff_appointment_id: dropoffId,
         ghl_pickup_appointment_id:  pickupId,
-        contact_id: contact_id || 'csv-rebuild-placeholder',
+        contact_id: contact_id || 'csv-import',
         owner_name:  s.contactName || null,
         owner_email: s.email || null,
         owner_phone: s.phone || null,
@@ -354,7 +354,7 @@ async function main() {
         service_type: s.serviceType,
         status: s.status,
         is_returning_client: false,
-        last_modified_source: 'internal',
+        last_modified_source: 'ghl',
         last_synced_at: new Date().toISOString(),
       };
     });
