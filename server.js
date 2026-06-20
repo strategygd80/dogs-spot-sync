@@ -9,12 +9,11 @@
 
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
+const bcrypt = require('bcryptjs');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 // ------------------------------------------------------------
@@ -29,26 +28,59 @@ const CONFIG = {
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  // optional: set in GHL webhook config
 
   // Calendar IDs — confirmed against GHL Settings → Calendars
+  // Each service type has 4 calendars: in-person/online x drop-off/pick-up
   CALENDARS: {
-    DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
-    DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
-    PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
-    PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
+    boarding: {
+      DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
+      DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
+      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
+      PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
+    },
+    basic: {
+      DROPOFF_INPERSON: '34JtodEqRp3K2wLp0a0y',   // Basic Drop Off
+      PICKUP_INPERSON:  'U53Ci7ndlS0NIkAa6vya',   // Basic Pick-up
+      // No distinct online calendars found for Basic — confirm if these exist
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    leash_free: {
+      DROPOFF_INPERSON: 'MXqoZqw2t3ewo1Oxja2m',   // Leash Free Drop Off
+      PICKUP_INPERSON:  'QBN6Y6UGIgDufXHz6B2I',    // Leash Free Pick Up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    service_dog: {
+      DROPOFF_INPERSON: 'U0sp9FfaU9qOiWp1Upb',     // Service Dog Drop Off
+      PICKUP_INPERSON:  '8rQdqxN39H6Db3Duf5ZX',    // Service Dog Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    community: {
+      DROPOFF_INPERSON: 'WMnuQPTsY8tz3JaxqPPf',    // Community Drop Off
+      PICKUP_INPERSON:  'DN6b9L0gVEwBI80v7Ctk',    // Community Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
+    bundle: {
+      DROPOFF_INPERSON: 'ZqzoS3ckFZafZcaUKyOM',    // Bundle Drop Off — CONFIRM THIS ID, image was partially cut off
+      PICKUP_INPERSON:  '2sAl9Q61WM2WNTqLqcGj',    // Bundle Pick-up
+      DROPOFF_ONLINE:   null,
+      PICKUP_ONLINE:    null,
+    },
   },
 
   // Window in hours within which two appointments are considered part of the same booking
   PAIRING_WINDOW_HOURS: 2,
 };
 
-// Derived sets for quick lookup
-const DROPOFF_CALENDAR_IDS = new Set([
-  CONFIG.CALENDARS.DROPOFF_INPERSON,
-  CONFIG.CALENDARS.DROPOFF_ONLINE,
-]);
-const PICKUP_CALENDAR_IDS = new Set([
-  CONFIG.CALENDARS.PICKUP_INPERSON,
-  CONFIG.CALENDARS.PICKUP_ONLINE,
-]);
+// Build lookup maps: calendarId -> { serviceType, role }
+const CALENDAR_LOOKUP = {};
+for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
+  if (cals.DROPOFF_INPERSON) CALENDAR_LOOKUP[cals.DROPOFF_INPERSON] = { serviceType, role: 'dropoff', source: 'internal' };
+  if (cals.DROPOFF_ONLINE)   CALENDAR_LOOKUP[cals.DROPOFF_ONLINE]   = { serviceType, role: 'dropoff', source: 'online' };
+  if (cals.PICKUP_INPERSON)  CALENDAR_LOOKUP[cals.PICKUP_INPERSON]  = { serviceType, role: 'pickup',  source: 'internal' };
+  if (cals.PICKUP_ONLINE)    CALENDAR_LOOKUP[cals.PICKUP_ONLINE]    = { serviceType, role: 'pickup',  source: 'online' };
+}
 
 // ------------------------------------------------------------
 // SUPABASE CLIENT
@@ -84,42 +116,7 @@ async function getContactAppointments(contactId) {
 
 async function getContact(contactId) {
   const res = await ghl.get(`/contacts/${contactId}`);
-  const raw = res.data?.contact || null;
-  if (!raw) return null;
-  const fullName =
-    raw.name ||
-    raw.contactName ||
-    [raw.firstName, raw.lastName].filter(Boolean).join(' ').trim() ||
-    raw.email ||
-    null;
-  return { ...raw, name: fullName };
-}
-
-// "Dog's Name" is a contact custom field in GHL, resolved once and cached
-let dogNameFieldId = null;
-async function resolveDogNameFieldId() {
-  if (dogNameFieldId) return dogNameFieldId;
-  try {
-    const res = await ghl.get('/locations/' + CONFIG.GHL_LOCATION + '/customFields');
-    const fields = res.data?.customFields || [];
-    let match = fields.find(f => (f.fieldKey || '').toLowerCase() === 'contact.dogs_name');
-    if (!match) {
-      match = fields.find(f =>
-        (f.name || '').toLowerCase().includes("dog") &&
-        (f.name || '').toLowerCase().includes("name")
-      );
-    }
-    if (match) dogNameFieldId = match.id;
-  } catch (err) {
-    console.error('Failed to fetch custom field definitions:', err.response?.data || err.message);
-  }
-  return dogNameFieldId;
-}
-
-function extractDogName(contact) {
-  if (!contact || !dogNameFieldId || !Array.isArray(contact.customFields)) return null;
-  const field = contact.customFields.find(f => f.id === dogNameFieldId);
-  return field?.value || field?.fieldValue || null;
+  return res.data?.contact || null;
 }
 
 // ------------------------------------------------------------
@@ -144,7 +141,7 @@ async function isReturningClient(contactId) {
 // Finds an existing incomplete stay for the same contact
 // within the pairing window to merge Drop Off + Pick Up
 // ------------------------------------------------------------
-async function findPairableStay(contactId, appointmentCreatedAt, role) {
+async function findPairableStay(contactId, appointmentCreatedAt, role, serviceType) {
   const windowStart = new Date(appointmentCreatedAt);
   windowStart.setHours(windowStart.getHours() - CONFIG.PAIRING_WINDOW_HOURS);
   const windowEnd = new Date(appointmentCreatedAt);
@@ -155,6 +152,7 @@ async function findPairableStay(contactId, appointmentCreatedAt, role) {
     .select('*')
     .eq('contact_id', contactId)
     .eq('status', 'incomplete')
+    .eq('service_type', serviceType)
     .gte('created_at', windowStart.toISOString())
     .lte('created_at', windowEnd.toISOString())
     // Only pair if the other half is missing
@@ -204,19 +202,15 @@ async function processAppointment(payload, eventType) {
     title,
   } = payload;
 
-  // Determine role of this appointment
-  const isDropoff = DROPOFF_CALENDAR_IDS.has(calendarId);
-  const isPickup  = PICKUP_CALENDAR_IDS.has(calendarId);
+  // Determine role + service type of this appointment via lookup map
+  const calMeta = CALENDAR_LOOKUP[calendarId];
 
-  if (!isDropoff && !isPickup) {
-    console.log(`Ignoring appointment from non-boarding calendar: ${calendarId}`);
+  if (!calMeta) {
+    console.log(`Ignoring appointment from unrecognized calendar: ${calendarId}`);
     return;
   }
 
-  const role   = isDropoff ? 'dropoff' : 'pickup';
-  const source = (calendarId === CONFIG.CALENDARS.DROPOFF_ONLINE || calendarId === CONFIG.CALENDARS.PICKUP_ONLINE)
-    ? 'online'
-    : 'internal';
+  const { serviceType, role, source } = calMeta;
 
   // Check if this appointment already exists in DB (update scenario)
   const existingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
@@ -245,7 +239,7 @@ async function processAppointment(payload, eventType) {
   }
 
   // NEW appointment — try to pair with existing incomplete stay
-  const pairableStay = await findPairableStay(contactId, new Date().toISOString(), role);
+  const pairableStay = await findPairableStay(contactId, new Date().toISOString(), role, serviceType);
 
   if (pairableStay) {
     // PAIR: merge this appointment into existing incomplete stay
@@ -257,6 +251,7 @@ async function processAppointment(payload, eventType) {
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
       source,
+      service_type: serviceType,
       status: pairableStay.status === 'incomplete' ? status : pairableStay.status,
       is_returning_client: status === 'confirmed' && source === 'online',
       last_modified_source: 'ghl',
@@ -265,7 +260,6 @@ async function processAppointment(payload, eventType) {
       owner_name:  pairableStay.owner_name  || contact?.name  || null,
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
-      dog_name:    pairableStay.dog_name    || extractDogName(contact),
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
@@ -280,8 +274,8 @@ async function processAppointment(payload, eventType) {
       owner_name:   contact?.name  || null,
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
-      dog_name:     extractDogName(contact),
       source,
+      service_type: serviceType,
       status: 'incomplete',
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
@@ -371,14 +365,15 @@ app.post('/webhook/ghl', async (req, res) => {
 // GET all stays with optional filters
 app.get('/api/stays', async (req, res) => {
   try {
-    const { status, source, from, to, search } = req.query;
+    const { status, source, serviceType, from, to, search } = req.query;
     let query = supabase.from('boarding_stays').select('*').order('start_date', { ascending: true });
 
-    if (status)  query = query.eq('status', status);
-    if (source)  query = query.eq('source', source);
-    if (from)    query = query.gte('start_date', from);
-    if (to)      query = query.lte('start_date', to);
-    if (search)  query = query.or(`owner_name.ilike.%${search}%,dog_name.ilike.%${search}%`);
+    if (status)      query = query.eq('status', status);
+    if (source)      query = query.eq('source', source);
+    if (serviceType) query = query.eq('service_type', serviceType);
+    if (from)        query = query.gte('start_date', from);
+    if (to)          query = query.lte('start_date', to);
+    if (search)       query = query.or(`owner_name.ilike.%${search}%,dog_name.ilike.%${search}%`);
 
     const { data, error } = await query;
     if (error) throw error;
@@ -586,6 +581,76 @@ app.get('/api/sync/failed', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+// AUTH — email + PIN login, with lockout after repeated failures
+// Matches against the portal_users table seeded via migration
+// ------------------------------------------------------------
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_MINUTES = 15;
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, pin } = req.body;
+    if (!email || !pin) return res.status(400).json({ error: 'Email and PIN required' });
+
+    const { data, error } = await supabase
+      .from('portal_users')
+      .select('*')
+      .eq('email', email.toLowerCase().trim())
+      .eq('is_active', true)
+      .limit(1);
+
+    if (error || !data || data.length === 0) {
+      return res.status(401).json({ error: 'No active account found for this email' });
+    }
+
+    const user = data[0];
+
+    // Check lockout
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      const minsLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
+      return res.status(423).json({ error: `Account locked. Try again in ${minsLeft} minute(s).` });
+    }
+
+    const pinMatches = await bcrypt.compare(String(pin), user.pin_hash || '');
+
+    if (!pinMatches) {
+      const newFailedAttempts = (user.failed_attempts || 0) + 1;
+      const updatePayload = { failed_attempts: newFailedAttempts };
+
+      if (newFailedAttempts >= MAX_FAILED_ATTEMPTS) {
+        const lockUntil = new Date(Date.now() + LOCKOUT_MINUTES * 60000);
+        updatePayload.locked_until = lockUntil.toISOString();
+      }
+
+      await supabase.from('portal_users').update(updatePayload).eq('id', user.id);
+
+      const remaining = Math.max(0, MAX_FAILED_ATTEMPTS - newFailedAttempts);
+      return res.status(401).json({
+        error: newFailedAttempts >= MAX_FAILED_ATTEMPTS
+          ? `Too many failed attempts. Account locked for ${LOCKOUT_MINUTES} minutes.`
+          : `Incorrect PIN. ${remaining} attempt(s) remaining.`,
+      });
+    }
+
+    // Success — reset failed attempts, update last login
+    await supabase.from('portal_users').update({
+      failed_attempts: 0,
+      locked_until: null,
+      last_login_at: new Date().toISOString(),
+    }).eq('id', user.id);
+
+    res.json({
+      id: user.id,
+      email: user.email,
+      displayName: user.display_name,
+      role: user.role,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
@@ -596,8 +661,4 @@ app.listen(CONFIG.PORT, () => {
   console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
   console.log(`Webhook endpoint: POST /webhook/ghl`);
   console.log(`API base: GET/PATCH /api/stays`);
-  resolveDogNameFieldId().then(id => {
-    if (id) console.log(`Resolved "Dog's Name" custom field ID: ${id}`);
-    else console.warn(`Could not resolve "Dog's Name" custom field — dog names won't sync until this is fixed.`);
-  });
 });
