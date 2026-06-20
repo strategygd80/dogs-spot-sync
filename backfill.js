@@ -20,6 +20,30 @@ const { createClient } = require('@supabase/supabase-js');
 // touch Supabase. Run this first after any pairing-logic change.
 const DRY_RUN = process.argv.includes('--dry-run');
 
+// ------------------------------------------------------------
+// NAME RESOLUTION
+// GHL's contact API can return name fields under different keys
+// depending on account/version. Rather than guessing one key,
+// check every plausible variant so this works regardless.
+// ------------------------------------------------------------
+function resolveOwnerName(contact) {
+  if (!contact) return null;
+
+  // Prefer an already-combined full name field, if present and non-empty.
+  const fullNameCandidates = [contact.name, contact.fullName, contact.full_name, contact.contactName];
+  for (const candidate of fullNameCandidates) {
+    if (candidate && String(candidate).trim()) return String(candidate).trim();
+  }
+
+  // Otherwise build it from first/last name, checking common casings.
+  const first = contact.firstName || contact.first_name || contact.firstname || '';
+  const last  = contact.lastName  || contact.last_name  || contact.lastname  || '';
+  const combined = [first, last].filter(Boolean).join(' ').trim();
+  if (combined) return combined;
+
+  return null;
+}
+
 const CONFIG = {
   GHL_TOKEN:    process.env.GHL_TOKEN,
   GHL_LOCATION: process.env.GHL_LOCATION,
@@ -144,16 +168,11 @@ async function fetchAppointmentsForCalendar(calendarId) {
 // FETCH CONTACT DETAILS
 // ------------------------------------------------------------
 const contactCache = new Map();
-let _debugContactLogged = false; // TEMP — prints raw shape of first contact fetched, then stops. Remove after confirming field names.
 async function getContact(contactId) {
   if (contactCache.has(contactId)) return contactCache.get(contactId);
   try {
     const res = await ghl.get(`/contacts/${contactId}`);
     const contact = res.data?.contact || null;
-    if (!_debugContactLogged) {
-      _debugContactLogged = true;
-      console.log('\n[DEBUG] Raw contact object from GHL API:\n', JSON.stringify(contact, null, 2), '\n');
-    }
     contactCache.set(contactId, contact);
     return contact;
   } catch (err) {
@@ -299,7 +318,7 @@ async function backfill() {
       dropoff_calendar_id: dropoff?.calendarId || null,
       pickup_calendar_id:  pickup?.calendarId  || null,
       contact_id:   contactId,
-      owner_name:   contact?.name || [contact?.first_name, contact?.last_name].filter(Boolean).join(' ') || null,
+      owner_name:   resolveOwnerName(contact),
       owner_email:  contact?.email || null,
       owner_phone:  contact?.phone || null,
       dog_name:     null, // not reliably available from appointment data — can be backfilled later from custom fields
