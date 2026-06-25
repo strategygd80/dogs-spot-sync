@@ -489,64 +489,64 @@ function getDateStringInTZ(date, timeZone = BUSINESS_TIMEZONE) {
   return formatter.format(date); // YYYY-MM-DD
 }
 
+// Shared helper — build dashboard payload for any target date (YYYY-MM-DD string).
+// If targetDateStr is omitted, defaults to today in the business timezone.
+async function buildDashboardForDate(targetDateStr) {
+  const now = new Date();
+  const resolvedDate = targetDateStr || getDateStringInTZ(now);
+
+  // Build a Date from the YYYY-MM-DD string so we can compute the next day safely.
+  // Append T12:00:00 to avoid any UTC-boundary drift when parsing as local time.
+  const targetDate  = new Date(`${resolvedDate}T12:00:00`);
+  const nextDate    = new Date(targetDate.getTime() + 86400000);
+  const nextDateStr = getDateStringInTZ(nextDate);
+
+  const { data: allStays } = await supabase
+    .from('boarding_stays')
+    .select('*')
+    .neq('status', 'cancelled');
+
+  const arrivals   = (allStays || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === resolvedDate);
+  const departures = (allStays || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === resolvedDate);
+
+  const active = (allStays || []).filter(s => {
+    if (!s.start_date) return false;
+    const startStr = getDateStringInTZ(new Date(s.start_date));
+    if (startStr > resolvedDate) return false;
+    if (!s.end_date) return true;
+    const endStr = getDateStringInTZ(new Date(s.end_date));
+    return endStr >= resolvedDate;
+  });
+
+  const [pendingRes, incompleteRes] = await Promise.all([
+    supabase.from('boarding_stays').select('*').eq('status', 'requested'),
+    supabase.from('boarding_stays').select('*').eq('status', 'incomplete'),
+  ]);
+
+  return {
+    date: resolvedDate,
+    arrivals,
+    departures,
+    active,
+    pending:    pendingRes.data    || [],
+    incomplete: incompleteRes.data || [],
+    counts: {
+      arrivals:   arrivals.length,
+      departures: departures.length,
+      active:     active.length,
+      pending:    pendingRes.data?.length    || 0,
+      incomplete: incompleteRes.data?.length || 0,
+    },
+  };
+}
+
 app.get('/api/dashboard/today', async (req, res) => {
   try {
-    const now = new Date();
-    const todayStr    = getDateStringInTZ(now);
-    const tomorrowStr = getDateStringInTZ(new Date(now.getTime() + 86400000));
-
-    // Pull a window of candidates, then filter precisely in JS using
-    // timezone-aware date comparison (Postgres date range queries on
-    // raw timestamps would hit the same UTC-boundary bug).
-    //
-    // IMPORTANT: only exclude 'cancelled' here, not 'incomplete'.
-    // A stay can be 'incomplete' (missing its pickup pairing) while
-    // still having a real dropoff appointment — that dog may be
-    // arriving today, or already in-house with no pickup booked yet.
-    // Both arrivals and active-stay calculations below account for this.
-    const { data: allStays } = await supabase
-      .from('boarding_stays')
-      .select('*')
-      .neq('status', 'cancelled');
-
-    const arrivals   = (allStays || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === todayStr);
-    const departures = (allStays || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === todayStr);
-
-    // A dog counts as "active" (in-house right now) if it has dropped off
-    // on or before today AND either:
-    //   (a) has no pickup scheduled yet (still here, pickup not synced/booked), or
-    //   (b) its scheduled pickup is today or later.
-    // Previously this required BOTH start_date and end_date to be set,
-    // which silently hid every dog with an unmatched/missing pickup —
-    // exactly the dogs staff most need visibility into.
-    const active = (allStays || []).filter(s => {
-      if (!s.start_date) return false;
-      const startStr = getDateStringInTZ(new Date(s.start_date));
-      if (startStr > todayStr) return false; // hasn't arrived yet
-      if (!s.end_date) return true;          // arrived, no pickup booked yet -> still active
-      const endStr = getDateStringInTZ(new Date(s.end_date));
-      return endStr >= todayStr;             // arrived, pickup is today or later -> still active
-    });
-
-    const [pendingRes, incompleteRes] = await Promise.all([
-      supabase.from('boarding_stays').select('*').eq('status', 'requested'),
-      supabase.from('boarding_stays').select('*').eq('status', 'incomplete'),
-    ]);
-
-    res.json({
-      arrivals,
-      departures,
-      active,
-      pending:    pendingRes.data    || [],
-      incomplete: incompleteRes.data || [],
-      counts: {
-        arrivals:   arrivals.length,
-        departures: departures.length,
-        active:     active.length,
-        pending:    pendingRes.data?.length    || 0,
-        incomplete: incompleteRes.data?.length || 0,
-      },
-    });
+    // Support optional ?date=YYYY-MM-DD so a single endpoint powers both
+    // "today" and any date the portal's date-picker selects.
+    const { date } = req.query;
+    const payload = await buildDashboardForDate(date || null);
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
