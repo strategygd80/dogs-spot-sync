@@ -149,6 +149,7 @@ async function main() {
   const idxEmail     = col('Email');
   const idxPhone     = col('Phone');
   const idxOutcome   = col('Outcome');
+  const idxDogName   = col('Dog Name'); // present in newer exports; -1 means absent (gracefully ignored)
 
   if ([idxId, idxTime, idxContact, idxCalendar, idxOutcome].some(i => i === -1)) {
     console.error('CSV is missing one or more expected columns. Found header:', header);
@@ -179,6 +180,7 @@ async function main() {
       contactName: (r[idxContact] || '').trim(),
       email: (r[idxEmail] || '').trim(),
       phone: (r[idxPhone] || '').trim(),
+      dogName: idxDogName !== -1 ? (r[idxDogName] || '').trim() || null : null,
       calendarName,
       serviceType: calMeta.serviceType,
       role: calMeta.role,
@@ -231,18 +233,18 @@ async function main() {
 
         if (d && p) {
           if (p.time >= d.time) {
-            stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, serviceType: d.serviceType, dropoff: d, pickup: p });
+            stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, dogName: d.dogName || p.dogName || null, serviceType: d.serviceType, dropoff: d, pickup: p });
             di++; pi++;
           } else {
             // Pickup predates this dropoff — it has no valid dropoff partner here.
-            stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, serviceType: p.serviceType, dropoff: null, pickup: p });
+            stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, dogName: p.dogName || null, serviceType: p.serviceType, dropoff: null, pickup: p });
             pi++;
           }
         } else if (d) {
-          stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, serviceType: d.serviceType, dropoff: d, pickup: null });
+          stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, dogName: d.dogName || null, serviceType: d.serviceType, dropoff: d, pickup: null });
           di++;
         } else if (p) {
-          stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, serviceType: p.serviceType, dropoff: null, pickup: p });
+          stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, dogName: p.dogName || null, serviceType: p.serviceType, dropoff: null, pickup: p });
           pi++;
         }
       }
@@ -333,8 +335,9 @@ async function main() {
     const batch = stays.slice(i, i + BATCH_SIZE).map(s => {
       const dropoffId = s.dropoff?.appointmentId || null;
       const pickupId  = s.pickup?.appointmentId  || null;
-      // Restore dog_name from snapshot (prefer dropoff key, fall back to pickup key)
+      // Dog name priority: (1) directly from CSV column, (2) snapshot from prior DB rows
       const dog_name =
+        s.dogName ||
         (dropoffId && dogNameByDropoff.get(dropoffId)) ||
         (pickupId  && dogNameByPickup.get(pickupId))   || null;
       const contact_id =
