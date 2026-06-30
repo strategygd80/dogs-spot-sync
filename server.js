@@ -223,19 +223,42 @@ async function isReturningClient(contactId) {
 
 // ------------------------------------------------------------
 // PAIRING ENGINE
-// Finds an existing incomplete stay for the same contact
-// within the pairing window to merge Drop Off + Pick Up
+// Finds an existing incomplete stay for the same contact whose
+// ghl_date_added falls within the pairing window of this
+// appointment's own dateAdded.
+//
+// WHY dateAdded INSTEAD OF created_at:
+//   Both legs of a stay (drop-off + pick-up) are booked by the
+//   customer in the same GHL session and share nearly identical
+//   dateAdded timestamps. Pairing on dateAdded is immune to
+//   webhook delivery delays of any duration up to the window size.
+//
+// PAIRING WINDOW BY GROUP:
+//   boarding  -> 24 h  owners sometimes book drop-off and come back
+//                      later the same day to book pick-up.
+//   flexible  ->  2 h  customers typically book both legs together.
 // ------------------------------------------------------------
-async function findPairableStay(contactId, appointmentCreatedAt, role, serviceType) {
-  const windowStart = new Date(appointmentCreatedAt);
-  windowStart.setHours(windowStart.getHours() - CONFIG.PAIRING_WINDOW_HOURS);
-  const windowEnd = new Date(appointmentCreatedAt);
-  windowEnd.setHours(windowEnd.getHours() + CONFIG.PAIRING_WINDOW_HOURS);
+const PAIRING_WINDOW_HOURS_BY_GROUP = {
+  boarding: 24,
+  flexible:  2,
+};
 
-  // Match against every service type in the same pairing group, not just
-  // an exact serviceType match. 'boarding' only matches 'boarding'; the
-  // other five service types are interchangeable with each other.
+async function findPairableStay(contactId, appointmentBookedAt, role, serviceType) {
+  const group       = pairingGroupOf(serviceType);
+  const windowHours = PAIRING_WINDOW_HOURS_BY_GROUP[group] ?? CONFIG.PAIRING_WINDOW_HOURS;
+
+  const bookedAt    = new Date(appointmentBookedAt);
+  const windowStart = new Date(bookedAt.getTime() - windowHours * 3600 * 1000);
+  const windowEnd   = new Date(bookedAt.getTime() + windowHours * 3600 * 1000);
+
+  // Match any service type in the same pairing group ('boarding'
+  // only pairs with itself; the flexible types pair with each other).
   const eligibleTypes = serviceTypesInGroup(serviceType);
+
+  // The field that must be NULL — we are filling in the missing half.
+  const missingField = role === 'dropoff'
+    ? 'ghl_pickup_appointment_id'   // we are the dropoff; find row missing its pickup
+    : 'ghl_dropoff_appointment_id'; // we are the pickup;  find row missing its dropoff
 
   const { data, error } = await supabase
     .from('boarding_stays')
@@ -243,11 +266,12 @@ async function findPairableStay(contactId, appointmentCreatedAt, role, serviceTy
     .eq('contact_id', contactId)
     .eq('status', 'incomplete')
     .in('service_type', eligibleTypes)
-    .gte('created_at', windowStart.toISOString())
-    .lte('created_at', windowEnd.toISOString())
-    // Only pair if the other half is missing
-    .is(role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id', null)
-    .order('created_at', { ascending: false })
+    // Match on when GHL says the appointment was booked (dateAdded),
+    // NOT on when our webhook wrote the row (created_at).
+    .gte('ghl_date_added', windowStart.toISOString())
+    .lte('ghl_date_added', windowEnd.toISOString())
+    .is(missingField, null)
+    .order('ghl_date_added', { ascending: false })
     .limit(1);
 
   if (error || !data || data.length === 0) return null;
@@ -290,7 +314,16 @@ async function processAppointment(payload, eventType) {
     endTime,
     status: ghlStatus,
     title,
+    // GHL sends the moment the customer booked the appointment as
+    // dateAdded (ISO string). We use this — not wall-clock time —
+    // to pair drop-off and pick-up appointments, because both legs
+    // of a stay are booked in the same GHL session and share nearly
+    // identical dateAdded values even when webhooks fire minutes apart.
+    dateAdded,
   } = payload;
+
+  // Normalise: fall back to now only if GHL omits the field entirely
+  const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
 
   // Determine role + service type of this appointment via lookup map
   const calMeta = CALENDAR_LOOKUP[calendarId];
@@ -315,6 +348,9 @@ async function processAppointment(payload, eventType) {
     const stay = existingStays[0];
     const updatePayload = {
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
+      // Always refresh ghl_date_added so the stored value matches what GHL
+      // is currently reporting — useful if the appointment was rebooked.
+      ghl_date_added: appointmentBookedAt,
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
     };
@@ -328,8 +364,11 @@ async function processAppointment(payload, eventType) {
     return;
   }
 
-  // NEW appointment — try to pair with existing incomplete stay
-  const pairableStay = await findPairableStay(contactId, new Date().toISOString(), role, serviceType);
+  // NEW appointment — try to pair with existing incomplete stay.
+  // Pass the GHL dateAdded timestamp so pairing is based on when the
+  // customer booked both appointments (same session), not when our
+  // webhooks happened to fire.
+  const pairableStay = await findPairableStay(contactId, appointmentBookedAt, role, serviceType);
 
   if (pairableStay) {
     // PAIR: merge this appointment into existing incomplete stay
@@ -355,6 +394,9 @@ async function processAppointment(payload, eventType) {
       owner_email: pairableStay.owner_email || contact?.email || null,
       owner_phone: pairableStay.owner_phone || contact?.phone || null,
       dog_name:    pairableStay.dog_name    || resolveDogName(contact),
+      // Keep the earliest dateAdded — the first leg of the pair was booked
+      // at this moment; the second leg may be fractionally later.
+      ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
@@ -375,6 +417,9 @@ async function processAppointment(payload, eventType) {
       status: 'incomplete',
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
+      // Store the GHL booking timestamp — this is the anchor for pairing
+      // when the second leg (pickup or dropoff) arrives via webhook.
+      ghl_date_added: appointmentBookedAt,
       [existingField]: ghlAppointmentId,
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
@@ -426,8 +471,22 @@ async function processCancellation(payload) {
 // WEBHOOK ENDPOINT (GHL → DB)
 // Configure this URL in GHL: Settings → Webhooks
 // Events: AppointmentCreate, AppointmentUpdate, AppointmentDelete
+//
+// SECURITY: if WEBHOOK_SECRET is set, GHL must send it back on every
+// request (as either a query param ?secret=... or header
+// x-webhook-secret) or the request is rejected before any DB write
+// happens. Without this check, anyone who discovers this URL could
+// POST fake appointment data and corrupt the boarding_stays table.
 // ------------------------------------------------------------
 app.post('/webhook/ghl', async (req, res) => {
+  if (CONFIG.WEBHOOK_SECRET) {
+    const providedSecret = req.query.secret || req.headers['x-webhook-secret'];
+    if (providedSecret !== CONFIG.WEBHOOK_SECRET) {
+      console.warn('Rejected webhook: missing or invalid secret');
+      return res.status(401).json({ error: 'Invalid webhook secret' });
+    }
+  }
+
   // Acknowledge immediately so GHL doesn't retry
   res.status(200).json({ received: true });
 
@@ -797,4 +856,7 @@ app.listen(CONFIG.PORT, () => {
   console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
   console.log(`Webhook endpoint: POST /webhook/ghl`);
   console.log(`API base: GET/PATCH /api/stays`);
+  if (!CONFIG.WEBHOOK_SECRET) {
+    console.warn('⚠ WEBHOOK_SECRET is not set — /webhook/ghl will accept requests from ANYONE who finds the URL. Set WEBHOOK_SECRET in your .env and add it to the GHL webhook config.');
+  }
 });
