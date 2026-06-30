@@ -149,7 +149,8 @@ async function main() {
   const idxEmail     = col('Email');
   const idxPhone     = col('Phone');
   const idxOutcome   = col('Outcome');
-  const idxDogName   = col('Dog Name'); // present in newer exports; -1 means absent (gracefully ignored)
+  const idxDogName   = col('Dog Name');   // present in newer exports; -1 means absent (gracefully ignored)
+  const idxDateAdded = col('Date added'); // when the customer booked in GHL — used for pairing
 
   if ([idxId, idxTime, idxContact, idxCalendar, idxOutcome].some(i => i === -1)) {
     console.error('CSV is missing one or more expected columns. Found header:', header);
@@ -177,6 +178,9 @@ async function main() {
     relevant.push({
       appointmentId: r[idxId],
       time,
+      // dateAdded is the GHL booking timestamp — what the pairing engine uses
+      // to match drop-off + pick-up from the same booking session.
+      dateAdded: idxDateAdded !== -1 ? (r[idxDateAdded] || '').trim() || null : null,
       contactName: (r[idxContact] || '').trim(),
       email: (r[idxEmail] || '').trim(),
       phone: (r[idxPhone] || '').trim(),
@@ -340,6 +344,11 @@ async function main() {
         s.dogName ||
         (dropoffId && dogNameByDropoff.get(dropoffId)) ||
         (pickupId  && dogNameByPickup.get(pickupId))   || null;
+
+      // Use the earliest GHL dateAdded between the two legs as the
+      // pairing anchor — matches how the live webhook flow stores it.
+      const rawDateAdded = s.dropoff?.dateAdded || s.pickup?.dateAdded || null;
+      const ghl_date_added = rawDateAdded ? new Date(rawDateAdded).toISOString() : null;
       const contact_id =
         (dropoffId && contactIdByDropoff.get(dropoffId)) ||
         (pickupId  && contactIdByPickup.get(pickupId))   || null;
@@ -351,6 +360,7 @@ async function main() {
         owner_email: s.email || null,
         owner_phone: s.phone || null,
         dog_name,
+        ghl_date_added,
         start_date: s.dropoff?.time.toISOString() || null,
         end_date:   s.pickup?.time.toISOString()  || null,
         source: 'internal',
