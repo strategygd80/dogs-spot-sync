@@ -91,7 +91,7 @@ const CONFIG = {
   // rows in the `kennels` table (see migration.sql): 20 large,
   // 20 medium, 10 small = 50 total.
   // ------------------------------------------------------------
-  KENNEL_COUNTS: { large: 20, medium: 20, small: 10 },
+  KENNEL_COUNTS: { regular: 20, special_needs: 10, small: 10 },
 
   // Custom field(s) on the GHL contact that store the dog's kennel
   // size (large/medium/small). Mirrors the DOG_NAME_FIELD_IDS pattern
@@ -221,22 +221,73 @@ function resolveDogName(contact) {
 // missing or unrecognized — the stay then gets flagged as
 // kennel_status='needs_size' for a human to resolve.
 // ------------------------------------------------------------
-const KENNEL_SIZE_ALIASES = {
-  l: 'large', lg: 'large', large: 'large', big: 'large',
-  m: 'medium', med: 'medium', medium: 'medium',
-  s: 'small', sm: 'small', small: 'small',
+// ------------------------------------------------------------
+// KENNEL CATEGORY MAPPING
+// GHL stores {{contact.kennel_category}} as a combined string
+// that encodes both the physical kennel type AND the dog's
+// graduation status. We split these into two separate fields:
+//   kennel_type       → which physical kennel section the dog uses
+//   kennel_grad_status → where the dog is in the program
+// ------------------------------------------------------------
+const KENNEL_CATEGORY_MAP = {
+  // Special Needs
+  'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
+  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
+  'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
+  'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
+  // Regular
+  'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
+  'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
+  // Small
+  'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
+  'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
-function resolveKennelType(contact) {
-  if (!contact) return null;
-  const customFields = contact.customFields || contact.customField || [];
-  if (!Array.isArray(customFields)) return null;
 
-  for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
-    const entry = customFields.find(f => f.id === fieldId);
-    const raw = (entry?.value || entry?.fieldValue || '').toString().trim().toLowerCase();
-    if (raw && KENNEL_SIZE_ALIASES[raw]) return KENNEL_SIZE_ALIASES[raw];
+// Returns { kennel_type, kennel_grad_status } or null if unrecognized.
+// Handles both the flat webhook payload format (top-level named keys)
+// and the contact API format (customFields array of {id, value}).
+function resolveKennelCategory(contact, flatPayload) {
+  let raw = null;
+
+  // Try flat webhook payload first — GHL sends custom fields as top-level
+  // named keys in webhook bodies e.g. { "Kennel Category": "Regular - Graduated" }
+  if (flatPayload) {
+    raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
   }
-  return null;
+
+  // Fall back to contact API format (array of {id, value})
+  if (!raw && contact) {
+    const customFields = contact.customFields || contact.customField || [];
+    if (Array.isArray(customFields)) {
+      for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
+        const entry = customFields.find(f => f.id === fieldId);
+        const val = entry?.value || entry?.fieldValue || null;
+        if (val) { raw = val; break; }
+      }
+    }
+    // Also check flat keys on the contact object itself
+    if (!raw) {
+      raw = contact['Kennel Category'] || contact['kennel_category'];
+    }
+  }
+
+  if (!raw) return null;
+  const key = String(raw).trim().toLowerCase();
+  return KENNEL_CATEGORY_MAP[key] || null;
+}
+
+// Convenience wrapper — returns just the kennel_type string (for
+// backwards-compatible calls that only need the physical type).
+function resolveKennelType(contact, flatPayload) {
+  return resolveKennelCategory(contact, flatPayload)?.kennel_type || null;
 }
 
 async function getContact(contactId) {
@@ -585,7 +636,12 @@ async function processAppointment(payload, eventType) {
       // at this moment; the second leg may be fractionally later.
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
       // Kennel size, if not already known, resolved from the GHL contact.
-      kennel_type: pairableStay.kennel_type || resolveKennelType(contact),
+      // Kennel category — resolve from contact API or flat webhook payload
+      ...(() => {
+        const cat = resolveKennelCategory(contact, payload) ||
+                    (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, kennel_grad_status: pairableStay.kennel_grad_status } : null);
+        return cat ? { kennel_type: cat.kennel_type, kennel_grad_status: cat.kennel_grad_status } : {};
+      })(),
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
@@ -613,7 +669,12 @@ async function processAppointment(payload, eventType) {
       // Kennel size resolved from the GHL contact, if available. If it's
       // still incomplete (missing dates) no kennel is assigned yet, but
       // storing the type now saves an extra GHL lookup once it's paired.
-      kennel_type: resolveKennelType(contact),
+      // Kennel category — resolve from contact API or flat webhook payload.
+      // Stores kennel_type (physical section) and kennel_grad_status separately.
+      ...(() => {
+        const cat = resolveKennelCategory(contact, payload);
+        return cat ? { kennel_type: cat.kennel_type, kennel_grad_status: cat.kennel_grad_status } : {};
+      })(),
       kennel_status: 'needs_size',
       [existingField]: ghlAppointmentId,
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
@@ -689,8 +750,26 @@ app.post('/webhook/ghl', async (req, res) => {
   // DEBUG — log the full raw payload so we can see exactly what GHL sends
   console.log('RAW WEBHOOK BODY:', JSON.stringify(req.body, null, 2));
 
-  const { type, ...payload } = req.body;
-  console.log(`Received webhook: ${type}`, payload?.id);
+  // GHL can send the event type under different keys depending on webhook version
+  const type = req.body.type || req.body.eventType || req.body.event || req.body.eventName;
+
+  // GHL can send the appointment ID under different keys too
+  const appointmentId = req.body.id || req.body.appointmentId || req.body.appointment_id;
+
+  // Build a normalised payload that processAppointment can always rely on
+  const payload = {
+    ...req.body,
+    id: appointmentId,
+    // GHL flat webhooks send contact_id at the top level (not nested)
+    contactId: req.body.contactId || req.body.contact_id,
+    calendarId: req.body.calendarId || req.body.calendar_id,
+    startTime: req.body.startTime || req.body.start_time,
+    endTime: req.body.endTime || req.body.end_time,
+    status: req.body.status || req.body.appointmentStatus,
+    dateAdded: req.body.dateAdded || req.body.date_added || req.body.createdAt,
+  };
+
+  console.log(`Received webhook: ${type} — appointmentId: ${appointmentId}`);
 
   try {
     if (type === 'AppointmentCreate' || type === 'AppointmentUpdate') {
