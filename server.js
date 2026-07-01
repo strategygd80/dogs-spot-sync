@@ -223,56 +223,63 @@ async function isReturningClient(contactId) {
 
 // ------------------------------------------------------------
 // PAIRING ENGINE
-// Finds an existing incomplete stay for the same contact whose
-// ghl_date_added falls within the pairing window of this
-// appointment's own dateAdded.
+// Finds an existing incomplete stay for the same contact to pair
+// this appointment with. Two very different pairing behaviors
+// depending on service group:
 //
-// WHY dateAdded INSTEAD OF created_at:
-//   Both legs of a stay (drop-off + pick-up) are booked by the
-//   customer in the same GHL session and share nearly identical
-//   dateAdded timestamps. Pairing on dateAdded is immune to
-//   webhook delivery delays of any duration up to the window size.
+// BOARDING — drop-off and pick-up are booked by the customer in
+//   the SAME GHL session, so we anchor on ghl_date_added (when GHL
+//   says the appointment was booked) and require both legs to fall
+//   within a tight time window of each other. This is immune to
+//   webhook delivery delays, but still scoped tightly because a
+//   customer could legitimately book two separate unrelated
+//   boarding stays for the same dog on the same day.
 //
-// PAIRING WINDOW BY GROUP:
-//   boarding  -> 24 h  owners sometimes book drop-off and come back
-//                      later the same day to book pick-up.
-//   flexible  ->  2 h  customers typically book both legs together.
+// FLEXIBLE (basic, bundle, leash_free, service_dog, community) —
+//   these are booked as INDEPENDENT, STANDALONE appointments,
+//   often days apart, and the customer can mix types freely
+//   (e.g. drop off as Basic, pick up as Community). There is NO
+//   reliable time relationship between the two legs, so we do NOT
+//   apply any time window at all. Instead we match the OLDEST
+//   unpaired appointment of any type in the flexible group for
+//   this contact (FIFO) — the longest-waiting incomplete leg gets
+//   completed first, which mirrors how staff actually think about
+//   "this dog has been dropped off and is still here."
 // ------------------------------------------------------------
-const PAIRING_WINDOW_HOURS_BY_GROUP = {
-  boarding: 24,
-  flexible:  2,
-};
+const BOARDING_PAIRING_WINDOW_HOURS = 24;
 
 async function findPairableStay(contactId, appointmentBookedAt, role, serviceType) {
-  const group       = pairingGroupOf(serviceType);
-  const windowHours = PAIRING_WINDOW_HOURS_BY_GROUP[group] ?? CONFIG.PAIRING_WINDOW_HOURS;
-
-  const bookedAt    = new Date(appointmentBookedAt);
-  const windowStart = new Date(bookedAt.getTime() - windowHours * 3600 * 1000);
-  const windowEnd   = new Date(bookedAt.getTime() + windowHours * 3600 * 1000);
-
-  // Match any service type in the same pairing group ('boarding'
-  // only pairs with itself; the flexible types pair with each other).
-  const eligibleTypes = serviceTypesInGroup(serviceType);
+  const group = pairingGroupOf(serviceType);
 
   // The field that must be NULL — we are filling in the missing half.
   const missingField = role === 'dropoff'
     ? 'ghl_pickup_appointment_id'   // we are the dropoff; find row missing its pickup
     : 'ghl_dropoff_appointment_id'; // we are the pickup;  find row missing its dropoff
 
-  const { data, error } = await supabase
+  let query = supabase
     .from('boarding_stays')
     .select('*')
     .eq('contact_id', contactId)
     .eq('status', 'incomplete')
-    .in('service_type', eligibleTypes)
-    // Match on when GHL says the appointment was booked (dateAdded),
-    // NOT on when our webhook wrote the row (created_at).
-    .gte('ghl_date_added', windowStart.toISOString())
-    .lte('ghl_date_added', windowEnd.toISOString())
-    .is(missingField, null)
-    .order('ghl_date_added', { ascending: false })
-    .limit(1);
+    .in('service_type', serviceTypesInGroup(serviceType))
+    .is(missingField, null);
+
+  if (group === 'boarding') {
+    // Tight proximity window anchored on GHL's own booking timestamp.
+    const bookedAt    = new Date(appointmentBookedAt);
+    const windowStart = new Date(bookedAt.getTime() - BOARDING_PAIRING_WINDOW_HOURS * 3600 * 1000);
+    const windowEnd   = new Date(bookedAt.getTime() + BOARDING_PAIRING_WINDOW_HOURS * 3600 * 1000);
+    query = query
+      .gte('ghl_date_added', windowStart.toISOString())
+      .lte('ghl_date_added', windowEnd.toISOString())
+      .order('ghl_date_added', { ascending: false });
+  } else {
+    // Flexible group: no time window. Oldest unpaired leg wins (FIFO),
+    // since these can be created on completely different dates.
+    query = query.order('ghl_date_added', { ascending: true });
+  }
+
+  const { data, error } = await query.limit(1);
 
   if (error || !data || data.length === 0) return null;
   return data[0];
