@@ -47,7 +47,7 @@ const CONFIG = {
     boarding: {
       DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
       DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
-      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX95R',   // Boarding Pick Up
+      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX9SR',   // Boarding Pick Up
       PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
     },
     basic: {
@@ -201,13 +201,19 @@ const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 
 function resolveDogName(contact) {
   if (!contact) return null;
-  const customFields = contact.customFields || contact.customField || [];
-  if (!Array.isArray(customFields)) return null;
 
-  for (const fieldId of DOG_NAME_FIELD_IDS) {
-    const entry = customFields.find(f => f.id === fieldId);
-    const value = entry?.value || entry?.fieldValue || null;
-    if (value && String(value).trim()) return String(value).trim();
+  // Flat webhook format — GHL sends custom fields as named top-level keys
+  const flatDog = contact["Dog's Name"] || contact['dogs_name'] || contact['dog_name'];
+  if (flatDog && String(flatDog).trim()) return String(flatDog).trim();
+
+  // Contact API format — customFields array of {id, value}
+  const customFields = contact.customFields || contact.customField || [];
+  if (Array.isArray(customFields)) {
+    for (const fieldId of DOG_NAME_FIELD_IDS) {
+      const entry = customFields.find(f => f.id === fieldId);
+      const value = entry?.value || entry?.fieldValue || null;
+      if (value && String(value).trim()) return String(value).trim();
+    }
   }
   return null;
 }
@@ -549,14 +555,16 @@ async function processAppointment(payload, eventType) {
     startTime,
     endTime,
     status: ghlStatus,
-    title,
-    // GHL sends the moment the customer booked the appointment as
-    // dateAdded (ISO string). We use this — not wall-clock time —
-    // to pair drop-off and pick-up appointments, because both legs
-    // of a stay are booked in the same GHL session and share nearly
-    // identical dateAdded values even when webhooks fire minutes apart.
     dateAdded,
+    _flatContact,  // raw GHL workflow body — used for flat custom field resolution
   } = payload;
+
+  // Pre-filled contact info from workflow webhook (saves a GHL API call)
+  const prefilled = _flatContact ? {
+    name:  _flatContact.full_name || [_flatContact.first_name, _flatContact.last_name].filter(Boolean).join(' ') || null,
+    email: _flatContact.email || null,
+    phone: _flatContact.phone || null,
+  } : null;
 
   // Normalise: fall back to now only if GHL omits the field entirely
   const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
@@ -610,7 +618,11 @@ async function processAppointment(payload, eventType) {
 
   if (pairableStay) {
     // PAIR: merge this appointment into existing incomplete stay
-    const contact = await getContact(contactId).catch(() => null);
+    // Use prefilled contact data from workflow webhook if available,
+    // fall back to a GHL API call only when needed.
+    const contact = (!prefilled || !resolveDogName(_flatContact))
+      ? await getContact(contactId).catch(() => null)
+      : null;
     const status  = await determineStatus(source, contactId);
 
     const updatePayload = {
@@ -627,11 +639,11 @@ async function processAppointment(payload, eventType) {
       is_returning_client: status === 'confirmed' && source === 'online',
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
-      // Fill contact info if missing
-      owner_name:  pairableStay.owner_name  || resolveOwnerName(contact),
-      owner_email: pairableStay.owner_email || contact?.email || null,
-      owner_phone: pairableStay.owner_phone || contact?.phone || null,
-      dog_name:    pairableStay.dog_name    || resolveDogName(contact),
+      // Fill contact info — prefer flat webhook fields, fall back to API
+      owner_name:  pairableStay.owner_name  || prefilled?.name  || resolveOwnerName(contact),
+      owner_email: pairableStay.owner_email || prefilled?.email || contact?.email || null,
+      owner_phone: pairableStay.owner_phone || prefilled?.phone || contact?.phone || null,
+      dog_name:    pairableStay.dog_name    || resolveDogName(_flatContact) || resolveDogName(contact),
       // Keep the earliest dateAdded — the first leg of the pair was booked
       // at this moment; the second leg may be fractionally later.
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
@@ -650,14 +662,18 @@ async function processAppointment(payload, eventType) {
     console.log(`Paired ${role} appointment into stay ${pairableStay.id}`);
   } else {
     // CREATE new incomplete stay (first half of pair)
-    const contact = await getContact(contactId).catch(() => null);
+    // Use prefilled contact data from workflow webhook if available,
+    // fall back to a GHL API call only when needed.
+    const contact = (!prefilled || !resolveDogName(_flatContact))
+      ? await getContact(contactId).catch(() => null)
+      : null;
 
     const insertPayload = {
       contact_id:   contactId,
-      owner_name:   resolveOwnerName(contact),
-      owner_email:  contact?.email || null,
-      owner_phone:  contact?.phone || null,
-      dog_name:     resolveDogName(contact),
+      owner_name:   prefilled?.name  || resolveOwnerName(contact),
+      owner_email:  prefilled?.email || contact?.email || null,
+      owner_phone:  prefilled?.phone || contact?.phone || null,
+      dog_name:     resolveDogName(_flatContact) || resolveDogName(contact),
       source,
       service_type: serviceType,
       status: 'incomplete',
@@ -750,26 +766,80 @@ app.post('/webhook/ghl', async (req, res) => {
   // DEBUG — log the full raw payload so we can see exactly what GHL sends
   console.log('RAW WEBHOOK BODY:', JSON.stringify(req.body, null, 2));
 
-  // GHL can send the event type under different keys depending on webhook version
-  const type = req.body.type || req.body.eventType || req.body.event || req.body.eventName;
+  const body = req.body;
 
-  // GHL can send the appointment ID under different keys too
-  const appointmentId = req.body.id || req.body.appointmentId || req.body.appointment_id;
+  // ── NORMALISE GHL WEBHOOK FORMAT ──────────────────────────────────
+  // GHL sends two very different shapes depending on how the webhook
+  // was configured:
+  //
+  // FORMAT A — Standard appointment webhook (Settings → Webhooks):
+  //   { type: 'AppointmentCreate', id: '...', calendarId: '...', ... }
+  //
+  // FORMAT B — Workflow webhook (Automation → Workflow → Webhook action):
+  //   All appointment data is nested under `calendar`, contact fields
+  //   are flat at the top level, and there is NO `type` field at all.
+  //   { calendar: { appointmentId, calendarId, startTime, status, ... },
+  //     contact_id: '...', first_name: '...', 'Kennel Category': '...' }
+  //
+  // We detect Format B by the presence of `body.calendar.appointmentId`
+  // and normalise everything into the shape processAppointment expects.
+  // ─────────────────────────────────────────────────────────────────
 
-  // Build a normalised payload that processAppointment can always rely on
-  const payload = {
-    ...req.body,
-    id: appointmentId,
-    // GHL flat webhooks send contact_id at the top level (not nested)
-    contactId: req.body.contactId || req.body.contact_id,
-    calendarId: req.body.calendarId || req.body.calendar_id,
-    startTime: req.body.startTime || req.body.start_time,
-    endTime: req.body.endTime || req.body.end_time,
-    status: req.body.status || req.body.appointmentStatus,
-    dateAdded: req.body.dateAdded || req.body.date_added || req.body.createdAt,
-  };
+  let type, payload;
 
-  console.log(`Received webhook: ${type} — appointmentId: ${appointmentId}`);
+  if (body.calendar && body.calendar.appointmentId) {
+    // FORMAT B — workflow webhook
+    const cal = body.calendar;
+
+    // Determine event type from appointment status
+    // GHL workflow webhooks don't have an explicit create/update flag,
+    // so we treat every incoming workflow event as an upsert — if the
+    // appointment already exists in the DB it updates, otherwise creates.
+    const apptStatus = (cal.appoinmentStatus || cal.appointmentStatus || cal.status || '').toLowerCase();
+    type = apptStatus === 'cancelled' ? 'AppointmentDelete' : 'AppointmentCreate';
+
+    payload = {
+      // Core appointment fields from the nested calendar object
+      id:         cal.appointmentId,
+      calendarId: cal.id,
+      startTime:  cal.startTime,
+      endTime:    cal.endTime,
+      status:     apptStatus,
+      dateAdded:  cal.date_created || body.date_created,
+      title:      cal.title,
+
+      // Contact fields from the flat top level
+      contactId:  body.contact_id,
+      ownerName:  body.full_name || [body.first_name, body.last_name].filter(Boolean).join(' '),
+      ownerEmail: body.email,
+      ownerPhone: body.phone,
+
+      // Pass the full body so resolveKennelCategory / resolveDogName
+      // can read flat custom fields like "Kennel Category", "Dog's Name"
+      _flatContact: body,
+    };
+
+    console.log(`Workflow webhook → normalised as ${type} — appointmentId: ${payload.id} calendarId: ${payload.calendarId}`);
+
+  } else {
+    // FORMAT A — standard appointment webhook
+    type = body.type || body.eventType || body.event || body.eventName;
+    const appointmentId = body.id || body.appointmentId || body.appointment_id;
+
+    payload = {
+      ...body,
+      id:         appointmentId,
+      contactId:  body.contactId  || body.contact_id,
+      calendarId: body.calendarId || body.calendar_id,
+      startTime:  body.startTime  || body.start_time,
+      endTime:    body.endTime    || body.end_time,
+      status:     body.status     || body.appointmentStatus,
+      dateAdded:  body.dateAdded  || body.date_added || body.createdAt,
+      _flatContact: body,
+    };
+
+    console.log(`Standard webhook: ${type} — appointmentId: ${appointmentId}`);
+  }
 
   try {
     if (type === 'AppointmentCreate' || type === 'AppointmentUpdate') {
