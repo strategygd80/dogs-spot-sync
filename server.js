@@ -349,9 +349,12 @@ async function findPairableStay(contactId, appointmentBookedAt, role, serviceTyp
   const group = pairingGroupOf(serviceType);
 
   // The field that must be NULL — we are filling in the missing half.
+  // (This must match our OWN role's field: a dropoff appointment should
+  // pair with a stay that already has a pickup but is still missing its
+  // dropoff, and vice versa.)
   const missingField = role === 'dropoff'
-    ? 'ghl_pickup_appointment_id'   // we are the dropoff; find row missing its pickup
-    : 'ghl_dropoff_appointment_id'; // we are the pickup;  find row missing its dropoff
+    ? 'ghl_dropoff_appointment_id'  // we are the dropoff; find row still missing its dropoff
+    : 'ghl_pickup_appointment_id';  // we are the pickup;  find row still missing its pickup
 
   let query = supabase
     .from('boarding_stays')
