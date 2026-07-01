@@ -85,6 +85,21 @@ const CONFIG = {
 
   // Window in hours within which two appointments are considered part of the same booking
   PAIRING_WINDOW_HOURS: 2,
+
+  // ------------------------------------------------------------
+  // KENNEL INVENTORY — fixed physical capacity, matches the seeded
+  // rows in the `kennels` table (see migration.sql): 20 special
+  // needs, 20 regular, 10 small dog, 5 overflow = 55 total.
+  // ------------------------------------------------------------
+  KENNEL_COUNTS: { special_needs: 20, regular: 20, small_dog: 10, overflow: 5 },
+
+  // Custom field(s) on the GHL contact that store the dog's kennel
+  // category, and — for boarding stays only — graduation status, as a
+  // single combined value (e.g. "Special Needs - Graduated"). Mirrors
+  // the DOG_NAME_FIELD_IDS pattern above — CONFIRM THE REAL FIELD ID
+  // once you've located it in GHL (Settings → Custom Fields) and
+  // replace the placeholder below.
+  KENNEL_CATEGORY_FIELD_IDS: ['REPLACE_WITH_KENNEL_CATEGORY_FIELD_ID'],
 };
 
 // Build lookup maps: calendarId -> { serviceType, role }
@@ -199,6 +214,57 @@ function resolveDogName(contact) {
   return null;
 }
 
+// ------------------------------------------------------------
+// CUSTOM FIELD — KENNEL CATEGORY (+ GRADUATION STATUS)
+// Reads the dog's kennel category off the GHL contact so every stay
+// can be auto-assigned a physical kennel without staff re-entering it.
+// The field holds a single combined value, e.g.:
+//   "Special Needs - Graduated"
+//   "Special Needs - Non-graduate"
+//   "Special Needs - In Process of Graduating"
+//   "Regular"   (no dash suffix is fine — graduation only applies to boarding)
+// Accepts loose values and normalises the category to one of:
+// special_needs / regular / small_dog / overflow, and the graduation
+// half (if present) to one of: graduated / non_graduate / in_process.
+// Returns nulls if the field is missing or unrecognized — the stay
+// then gets flagged as kennel_status='needs_size' for a human to
+// resolve.
+// ------------------------------------------------------------
+const KENNEL_CATEGORY_ALIASES = {
+  'special needs': 'special_needs', 'specialneeds': 'special_needs', 'sn': 'special_needs',
+  'regular': 'regular', 'reg': 'regular', 'r': 'regular',
+  'small dog': 'small_dog', 'smalldog': 'small_dog', 'small': 'small_dog', 'sd': 'small_dog',
+  'overflow': 'overflow', 'of': 'overflow',
+};
+const GRADUATION_ALIASES = {
+  'graduated': 'graduated', 'grad': 'graduated',
+  'non-graduate': 'non_graduate', 'non graduate': 'non_graduate', 'nongraduate': 'non_graduate', 'not graduated': 'non_graduate',
+  'in process of graduating': 'in_process', 'in-process': 'in_process', 'in process': 'in_process', 'inprocess': 'in_process',
+};
+function resolveKennelCategory(contact) {
+  if (!contact) return { kennelType: null, graduationStatus: null };
+  const customFields = contact.customFields || contact.customField || [];
+  if (!Array.isArray(customFields)) return { kennelType: null, graduationStatus: null };
+
+  for (const fieldId of CONFIG.KENNEL_CATEGORY_FIELD_IDS) {
+    const entry = customFields.find(f => f.id === fieldId);
+    const raw = (entry?.value || entry?.fieldValue || '').toString().trim().toLowerCase();
+    if (!raw) continue;
+
+    // Combined value looks like "Special Needs - Graduated". Split on the
+    // first " - " (or bare "-") to separate category from graduation status.
+    const parts = raw.split(/\s*-\s*/);
+    const categoryRaw = parts[0]?.trim();
+    const graduationRaw = parts.slice(1).join(' - ').trim();
+
+    const kennelType = categoryRaw && KENNEL_CATEGORY_ALIASES[categoryRaw] ? KENNEL_CATEGORY_ALIASES[categoryRaw] : null;
+    const graduationStatus = graduationRaw && GRADUATION_ALIASES[graduationRaw] ? GRADUATION_ALIASES[graduationRaw] : null;
+
+    if (kennelType) return { kennelType, graduationStatus };
+  }
+  return { kennelType: null, graduationStatus: null };
+}
+
 async function getContact(contactId) {
   const res = await ghl.get(`/contacts/${contactId}`);
   return res.data?.contact || null;
@@ -301,6 +367,162 @@ async function logSync({ stayId, ghlAppointmentId, direction, action, payload, s
 }
 
 // ------------------------------------------------------------
+// KENNEL ASSIGNMENT ENGINE
+// 55 physical kennels total: 20 special needs, 20 regular, 10 small
+// dog, 5 overflow (see CONFIG.KENNEL_COUNTS and the `kennels` table
+// in migration.sql). Every stay that has a start_date gets matched to
+// one specific kennel for its whole date range. If none of the right
+// category is free, or the dog's category isn't on file, the stay is
+// flagged (kennel_status = 'unassigned' / 'needs_size') so staff can
+// see the shortfall on the Kennels page and resolve it manually.
+//
+// Graduation status (graduated / non_graduate / in_process) rides
+// alongside the category on boarding stays only — it's a label for
+// staff reference, not a separate physical pool, so it never affects
+// which kennel gets picked.
+// ------------------------------------------------------------
+async function getAllKennels() {
+  const { data, error } = await supabase.from('kennels').select('*').eq('active', true).order('label');
+  if (error) throw error;
+  return data || [];
+}
+
+// Two date ranges overlap if each starts on/before the other's end.
+// A stay with no end_date yet is treated as open-ended (blocks forward
+// indefinitely) since we don't know when the dog is leaving.
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  const aE = aEnd || '9999-12-31';
+  const bE = bEnd || '9999-12-31';
+  return aStart <= bE && bStart <= aE;
+}
+
+async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId) {
+  if (!startDate) return null;
+  const kennels = (await getAllKennels()).filter(k => k.type === kennelType);
+  if (!kennels.length) return null;
+
+  const { data: occupied, error } = await supabase
+    .from('boarding_stays')
+    .select('id, kennel_id, start_date, end_date, status')
+    .not('kennel_id', 'is', null);
+  if (error) throw error;
+
+  const busyKennelIds = new Set(
+    (occupied || [])
+      .filter(s => s.id !== excludeStayId)
+      .filter(s => !['cancelled', 'completed'].includes(s.status))
+      .filter(s => s.start_date && rangesOverlap(startDate, endDate, s.start_date, s.end_date))
+      .map(s => s.kennel_id)
+  );
+
+  return kennels.find(k => !busyKennelIds.has(k.id)) || null;
+}
+
+// Determines the right kennel_id / kennel_type / kennel_status
+// (and, for boarding stays, graduation_status) for a stay, without
+// writing to the DB. Pure function of (stay, GHL contact).
+async function computeKennelAssignment(stay) {
+  const isBoarding = stay.service_type === 'boarding';
+  // graduation_status only ever applies to boarding stays — every other
+  // service type keeps it null regardless of what's on the GHL contact.
+  let graduationStatus = isBoarding ? (stay.graduation_status || null) : null;
+
+  if (!stay.start_date) {
+    return { kennel_id: null, kennel_type: stay.kennel_type || null, kennel_status: 'needs_size', graduation_status: graduationStatus };
+  }
+
+  let kennelType = stay.kennel_type;
+  if (!kennelType || (isBoarding && !graduationStatus)) {
+    const contact = await getContact(stay.contact_id).catch(() => null);
+    const resolved = resolveKennelCategory(contact);
+    if (!kennelType) kennelType = resolved.kennelType;
+    if (isBoarding && !graduationStatus) graduationStatus = resolved.graduationStatus;
+  }
+
+  if (!kennelType) {
+    return { kennel_id: null, kennel_type: null, kennel_status: 'needs_size', graduation_status: graduationStatus };
+  }
+
+  const kennel = await findAvailableKennel(kennelType, stay.start_date, stay.end_date, stay.id);
+  if (!kennel) {
+    return { kennel_id: null, kennel_type: kennelType, kennel_status: 'unassigned', graduation_status: graduationStatus };
+  }
+  return { kennel_id: kennel.id, kennel_type: kennelType, kennel_status: 'assigned', graduation_status: graduationStatus };
+}
+
+// Loads a stay by id, computes its kennel assignment, writes the
+// result back, and logs a flagged event if it couldn't be fully
+// assigned. Safe to call any time a stay's dates or size become
+// known (webhook create/update/pair, or after a manual edit).
+async function assignKennelAndSave(stayId) {
+  const { data: stay, error } = await supabase.from('boarding_stays').select('*').eq('id', stayId).single();
+  if (error || !stay) return null;
+
+  const result = await computeKennelAssignment(stay);
+  await supabase.from('boarding_stays').update(result).eq('id', stayId);
+
+  if (result.kennel_status !== 'assigned') {
+    await logSync({
+      stayId,
+      direction: 'db_to_ghl',
+      action: result.kennel_status === 'needs_size' ? 'kennel flagged — no size on file' : 'kennel flagged — no availability',
+      payload: { kennel_type: result.kennel_type },
+      status: 'failed',
+      errorMessage: result.kennel_status === 'needs_size'
+        ? 'Dog size not found on GHL contact'
+        : `No ${result.kennel_type} kennel available for these dates`,
+    });
+  }
+  return result;
+}
+
+// Kennel occupancy snapshot for a single date — used by both the
+// dashboard endpoint and the dedicated /api/kennels/occupancy route.
+async function getKennelOccupancySummary(dateStr) {
+  const kennels = await getAllKennels();
+  const { data: stays, error } = await supabase.from('boarding_stays').select('*');
+  if (error) throw error;
+
+  const live = (stays || []).filter(s => !['cancelled', 'completed'].includes(s.status));
+
+  const occupying = live.filter(s =>
+    s.kennel_id && s.start_date && s.start_date <= dateStr && (!s.end_date || s.end_date >= dateStr)
+  );
+  const byKennel = {};
+  occupying.forEach(s => { byKennel[s.kennel_id] = s; });
+
+  const flagged = live.filter(s =>
+    s.start_date && s.start_date <= dateStr && (!s.end_date || s.end_date >= dateStr) &&
+    s.kennel_status && s.kennel_status !== 'assigned'
+  );
+
+  const summary = {
+    special_needs: { total: 0, filled: 0 },
+    regular:       { total: 0, filled: 0 },
+    small_dog:     { total: 0, filled: 0 },
+    overflow:      { total: 0, filled: 0 },
+  };
+  kennels.forEach(k => {
+    if (!summary[k.type]) return;
+    summary[k.type].total++;
+    if (byKennel[k.id]) summary[k.type].filled++;
+  });
+
+  return {
+    date: dateStr,
+    summary,
+    kennels: kennels.map(k => ({
+      ...k,
+      occupiedBy: byKennel[k.id] ? {
+        id: byKennel[k.id].id, dogName: byKennel[k.id].dog_name, ownerName: byKennel[k.id].owner_name,
+        startDate: byKennel[k.id].start_date, endDate: byKennel[k.id].end_date,
+      } : null,
+    })),
+    flagged,
+  };
+}
+
+// ------------------------------------------------------------
 // DETERMINE STATUS
 // ------------------------------------------------------------
 async function determineStatus(source, contactId) {
@@ -366,6 +588,8 @@ async function processAppointment(payload, eventType) {
     if (ghlStatus === 'cancelled') updatePayload.status = 'cancelled';
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
+    // Dates may have shifted (reschedule from GHL) — re-check kennel availability.
+    if (updatePayload.status !== 'cancelled') await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', err.message));
     await logSync({ stayId: stay.id, ghlAppointmentId, direction: 'ghl_to_db', action: eventType === 'AppointmentCreate' ? 'created' : 'updated', payload });
     console.log(`Updated stay ${stay.id} from GHL (${role})`);
     return;
@@ -404,9 +628,16 @@ async function processAppointment(payload, eventType) {
       // Keep the earliest dateAdded — the first leg of the pair was booked
       // at this moment; the second leg may be fractionally later.
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
+      // Kennel category, if not already known, resolved from the GHL contact.
+      // Graduation status only applies once we know this is a boarding stay.
+      kennel_type: pairableStay.kennel_type || resolveKennelCategory(contact).kennelType,
+      ...(( (role === 'dropoff' ? serviceType : pairableStay.service_type) === 'boarding')
+        ? { graduation_status: pairableStay.graduation_status || resolveKennelCategory(contact).graduationStatus }
+        : {}),
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
+    await assignKennelAndSave(pairableStay.id).catch(err => console.error('Kennel assignment error:', err.message));
     await logSync({ stayId: pairableStay.id, ghlAppointmentId, direction: 'ghl_to_db', action: 'paired', payload });
     console.log(`Paired ${role} appointment into stay ${pairableStay.id}`);
   } else {
@@ -427,6 +658,13 @@ async function processAppointment(payload, eventType) {
       // Store the GHL booking timestamp — this is the anchor for pairing
       // when the second leg (pickup or dropoff) arrives via webhook.
       ghl_date_added: appointmentBookedAt,
+      // Kennel category (and, for boarding, graduation status) resolved
+      // from the GHL contact, if available. If it's still incomplete
+      // (missing dates) no kennel is assigned yet, but storing these now
+      // saves an extra GHL lookup once it's paired.
+      kennel_type: resolveKennelCategory(contact).kennelType,
+      ...(serviceType === 'boarding' ? { graduation_status: resolveKennelCategory(contact).graduationStatus } : {}),
+      kennel_status: 'needs_size',
       [existingField]: ghlAppointmentId,
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
@@ -440,6 +678,7 @@ async function processAppointment(payload, eventType) {
 
     if (error) throw error;
 
+    await assignKennelAndSave(newStay.id).catch(err => console.error('Kennel assignment error:', err.message));
     await logSync({ stayId: newStay.id, ghlAppointmentId, direction: 'ghl_to_db', action: 'created', payload });
     console.log(`Created incomplete stay ${newStay.id} waiting for ${role === 'dropoff' ? 'pickup' : 'dropoff'}`);
   }
@@ -527,12 +766,14 @@ app.post('/webhook/ghl', async (req, res) => {
 // GET all stays with optional filters
 app.get('/api/stays', async (req, res) => {
   try {
-    const { status, source, serviceType, from, to, search } = req.query;
+    const { status, source, serviceType, from, to, search, kennelType, kennelStatus } = req.query;
     let query = supabase.from('boarding_stays').select('*').order('start_date', { ascending: true });
 
     if (status)      query = query.eq('status', status);
     if (source)      query = query.eq('source', source);
     if (serviceType) query = query.eq('service_type', serviceType);
+    if (kennelType)  query = query.eq('kennel_type', kennelType);
+    if (kennelStatus) query = query.eq('kennel_status', kennelStatus);
     if (from)        query = query.gte('start_date', from);
     if (to)          query = query.lte('start_date', to);
     if (search)       query = query.or(`owner_name.ilike.%${search}%,dog_name.ilike.%${search}%`);
@@ -589,6 +830,8 @@ async function buildDashboardForDate(targetDateStr) {
     supabase.from('boarding_stays').select('*').eq('status', 'incomplete'),
   ]);
 
+  const kennelOccupancy = await getKennelOccupancySummary(resolvedDate);
+
   return {
     date: resolvedDate,
     arrivals,
@@ -603,6 +846,7 @@ async function buildDashboardForDate(targetDateStr) {
       pending:    pendingRes.data?.length    || 0,
       incomplete: incompleteRes.data?.length || 0,
     },
+    kennelOccupancy,
   };
 }
 
@@ -613,6 +857,98 @@ app.get('/api/dashboard/today', async (req, res) => {
     const { date } = req.query;
     const payload = await buildDashboardForDate(date || null);
     res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET kennel inventory (the 50-kennel list)
+app.get('/api/kennels', async (req, res) => {
+  try {
+    const kennels = await getAllKennels();
+    res.json(kennels);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET kennel occupancy for a given date (defaults to today) — powers the Kennels page
+app.get('/api/kennels/occupancy', async (req, res) => {
+  try {
+    const dateStr = req.query.date || getDateStringInTZ(new Date());
+    const payload = await getKennelOccupancySummary(dateStr);
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH — manually assign/reassign/clear a stay's kennel (staff override)
+app.patch('/api/stays/:id/kennel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { kennel_id, graduation_status } = req.body; // kennel_id null/omitted clears the assignment
+    const { data: stay, error } = await supabase.from('boarding_stays').select('*').eq('id', id).single();
+    if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
+
+    // graduation_status is only meaningful for boarding stays; ignore it
+    // (rather than error) if sent for any other service type.
+    const graduationUpdate = stay.service_type === 'boarding' && graduation_status !== undefined
+      ? { graduation_status: graduation_status || null }
+      : {};
+
+    if (kennel_id) {
+      const { data: kennel, error: kErr } = await supabase.from('kennels').select('*').eq('id', kennel_id).single();
+      if (kErr || !kennel) return res.status(404).json({ error: 'Kennel not found' });
+
+      const available = await findAvailableKennel(kennel.type, stay.start_date, stay.end_date, stay.id);
+      if (!available || available.id !== kennel_id) {
+        console.warn(`Manual kennel assignment: ${kennel_id} for stay ${id} overlaps another stay's dates — proceeding anyway per staff override.`);
+      }
+
+      await supabase.from('boarding_stays').update({
+        kennel_id, kennel_type: kennel.type, kennel_status: 'assigned', ...graduationUpdate,
+        last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
+      }).eq('id', id);
+    } else {
+      await supabase.from('boarding_stays').update({
+        kennel_id: null,
+        kennel_status: stay.kennel_type ? 'unassigned' : 'needs_size',
+        ...graduationUpdate,
+        last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
+      }).eq('id', id);
+    }
+
+    await logSync({ stayId: id, direction: 'db_to_ghl', action: 'kennel reassigned', payload: req.body, status: 'success' });
+    res.json({ success: true });
+  } catch (err) {
+    await logSync({ stayId: req.params.id, direction: 'db_to_ghl', action: 'kennel reassigned', payload: req.body, status: 'failed', errorMessage: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST — backfill kennel assignments for every existing stay that
+// doesn't have one yet (run once after deploying this feature, and
+// any time you want to re-sweep for newly-freed kennels).
+app.post('/api/kennels/backfill', async (req, res) => {
+  try {
+    const { data: stays, error } = await supabase
+      .from('boarding_stays')
+      .select('id')
+      .not('status', 'in', '(cancelled,completed)')
+      .neq('kennel_status', 'assigned');
+    if (error) throw error;
+
+    const results = { total: stays.length, assigned: 0, unassigned: 0, needsSize: 0 };
+    for (const s of stays) {
+      const outcome = await assignKennelAndSave(s.id).catch(() => null);
+      if (!outcome) continue;
+      if (outcome.kennel_status === 'assigned') results.assigned++;
+      else if (outcome.kennel_status === 'unassigned') results.unassigned++;
+      else results.needsSize++;
+    }
+
+    res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -642,7 +978,33 @@ app.get('/api/dashboard/reporting', async (req, res) => {
       returning:  data.filter(s => s.is_returning_client).length,
     };
 
-    res.json({ totals, stays: data });
+    // How many bookings in this range used each kennel category, plus how
+    // many were flagged (no category on file / no kennel available) —
+    // distinct from the live "kennels filled right now" snapshot below.
+    const kennelBreakdown = {
+      specialNeeds: data.filter(s => s.kennel_type === 'special_needs' && s.kennel_status === 'assigned').length,
+      regular:      data.filter(s => s.kennel_type === 'regular'      && s.kennel_status === 'assigned').length,
+      smallDog:     data.filter(s => s.kennel_type === 'small_dog'    && s.kennel_status === 'assigned').length,
+      overflow:     data.filter(s => s.kennel_type === 'overflow'     && s.kennel_status === 'assigned').length,
+      unassigned:   data.filter(s => s.kennel_status === 'unassigned').length,
+      needsSize:    data.filter(s => s.kennel_status === 'needs_size').length,
+    };
+
+    // Graduation status breakdown — boarding stays only.
+    const graduationBreakdown = {
+      graduated:    data.filter(s => s.service_type === 'boarding' && s.graduation_status === 'graduated').length,
+      nonGraduate:  data.filter(s => s.service_type === 'boarding' && s.graduation_status === 'non_graduate').length,
+      inProcess:    data.filter(s => s.service_type === 'boarding' && s.graduation_status === 'in_process').length,
+    };
+
+    // Live, real-time snapshot of physical kennel capacity (not affected by from/to)
+    const kennelOccupancy = await getKennelOccupancySummary(getDateStringInTZ(new Date()));
+
+    // Bookings broken down by program type (boarding, basic, bundle, etc.)
+    const serviceBreakdown = {};
+    data.forEach(s => { serviceBreakdown[s.service_type] = (serviceBreakdown[s.service_type] || 0) + 1; });
+
+    res.json({ totals, kennelBreakdown, graduationBreakdown, kennelOccupancy, serviceBreakdown, stays: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -704,6 +1066,9 @@ app.patch('/api/stays/:id/reschedule', async (req, res) => {
     if (end_date)   dbUpdate.end_date   = end_date;
 
     await supabase.from('boarding_stays').update(dbUpdate).eq('id', id);
+    // Dates changed — the previously-assigned kennel may now conflict
+    // with something else, or a kennel may have freed up. Re-check.
+    await assignKennelAndSave(id).catch(err => console.error('Kennel assignment error:', err.message));
     await logSync({ stayId: id, direction: 'db_to_ghl', action: 'rescheduled', payload: req.body, status: 'success' });
     res.json({ success: true });
   } catch (err) {
