@@ -55,11 +55,13 @@ const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 // entirely — it's not a boarding stay.
 // ------------------------------------------------------------
 const CALENDAR_MAP = {
+  // ── BOARDING (paired by proximity — same booking session) ──
   'Boarding Drop Off':          { serviceType: 'boarding',    role: 'dropoff' },
   'Boarding Drop Off - Online': { serviceType: 'boarding',    role: 'dropoff' },
   'Boarding Pick Up':           { serviceType: 'boarding',    role: 'pickup'  },
   'Boarding Pick Up - Online':  { serviceType: 'boarding',    role: 'pickup'  },
 
+  // ── FLEXIBLE (paired FIFO across any type in the group) ──
   'Basic Drop Off':             { serviceType: 'basic',       role: 'dropoff' },
   'Basic Pick-up':              { serviceType: 'basic',       role: 'pickup'  },
   'Bundle Drop Off':            { serviceType: 'bundle',      role: 'dropoff' },
@@ -70,6 +72,15 @@ const CALENDAR_MAP = {
   'Service Dog Pick-up':        { serviceType: 'service_dog', role: 'pickup'  },
   'Community Drop Off':         { serviceType: 'community',   role: 'dropoff' },
   'Community Pick-up':          { serviceType: 'community',   role: 'pickup'  },
+  'Bootcamp Pick-up':           { serviceType: 'community',   role: 'pickup'  },
+
+  // ── INTENTIONALLY IGNORED — not dropoff/pickup stays ──
+  // These are standalone appointments (consultations, events, lessons)
+  // that don't map to a boarding stay and are skipped during import.
+  'Meet & Greet':                          null,
+  'P.U.P.S Club Community lesson':         null,
+  'Free Dog Training Day':                 null,
+  'Free Training Consultation (Facility)': null,
 };
 
 const PAIRING_GROUPS = {
@@ -150,7 +161,10 @@ async function main() {
   const idxPhone     = col('Phone');
   const idxOutcome   = col('Outcome');
   const idxDogName   = col('Dog Name');   // present in newer exports; -1 means absent (gracefully ignored)
-  const idxDateAdded = col('Date added'); // when the customer booked in GHL — used for pairing
+  // GHL exports this column as "ghl_date_added" (the booking timestamp).
+  // Older exports may call it "Date added". Accept either so the script
+  // works regardless of which export format is used.
+  const idxDateAdded = col('ghl_date_added') !== -1 ? col('ghl_date_added') : col('Date added');
 
   if ([idxId, idxTime, idxContact, idxCalendar, idxOutcome].some(i => i === -1)) {
     console.error('CSV is missing one or more expected columns. Found header:', header);
@@ -161,10 +175,17 @@ async function main() {
 
   // Step 1: filter to boarding-type calendars only, exclude cancelled/invalid/noshow
   const relevant = [];
+  const unknownCalendars = new Set(); // calendars not in CALENDAR_MAP at all — printed as warnings
   for (const r of dataRows) {
     const calendarName = (r[idxCalendar] || '').trim();
     const calMeta = CALENDAR_MAP[calendarName];
-    if (!calMeta) continue; // not a boarding-type calendar — ignore (training, daycare, meet & greet, etc.)
+    // null  = explicitly listed as ignored (Meet & Greet, events, etc.) — skip silently
+    // undefined = not in the map at all — log a warning so missing calendars are visible
+    if (calMeta === null) continue;
+    if (calMeta === undefined) {
+      unknownCalendars.add(calendarName);
+      continue;
+    }
 
     const outcome = (r[idxOutcome] || '').trim().toLowerCase();
     if (EXCLUDED_OUTCOMES.has(outcome)) continue;
@@ -193,7 +214,13 @@ async function main() {
     });
   }
 
-  console.log(`${relevant.length} relevant boarding-type appointments (after excluding cancelled/invalid/noshow and non-boarding calendars).\n`);
+  console.log(`${relevant.length} relevant boarding-type appointments (after excluding cancelled/invalid/noshow and non-boarding calendars).`);
+  if (unknownCalendars.size > 0) {
+    console.warn(`\n⚠ ${unknownCalendars.size} calendar name(s) not in CALENDAR_MAP — rows skipped:`);
+    for (const name of [...unknownCalendars].sort()) console.warn(`    "${name}"`);
+    console.warn('  Add them to CALENDAR_MAP in rebuild-from-csv.js if they should be imported.');
+  }
+  console.log('');
 
   // Step 2: group by contact identity. Email is the most stable key when
   // present; fall back to phone, then name, since the CSV has no contact ID.
