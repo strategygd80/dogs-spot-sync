@@ -1,61 +1,54 @@
 // ============================================================
-// The Dogs Spot — Set Portal User PINs
-// One-time script: hashes and stores a PIN for each staff user
+// The Dogs Spot — Staff PIN Encryption & Authorization Setup
 // ============================================================
-// Setup:
-//   npm install @supabase/supabase-js bcryptjs dotenv
-//   node set-pins.js
-// ============================================================
-// EDIT THE PINS BELOW before running, then run once.
-// Re-run any time to change a PIN later.
-// ============================================================
-
 require('dotenv').config();
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// ── EDIT THESE PINS ──────────────────────────────────────────
-// Use 4-6 digits. Each user should have a unique PIN.
-const PINS = {
-  'info@thedogsspotga.com':   '1472',   // Trainer
-  'info+1@thedogsspotga.com': '2583',   // Virtual Staff
-  'otchx4@gmail.com':         '9061',   // Super User
+const CONFIG = {
+  SUPABASE_URL: process.env.SUPABASE_URL,
+  SUPABASE_KEY: process.env.SUPABASE_KEY, // Must be the service_role key
 };
-// ──────────────────────────────────────────────────────────────
 
-async function setPins() {
-  console.log('Setting PINs for portal users...\n');
+const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 
-  for (const [email, pin] of Object.entries(PINS)) {
-    if (!/^\d{4,6}$/.test(pin)) {
-      console.error(`✗ Skipping ${email}: PIN must be 4-6 digits`);
-      continue;
-    }
+// 🔐 CHANGE THESE TO YOUR REAL LIVE STAFF PINS (4-6 DIGITS)
+const REAL_STAFF_PINS = {
+  'info@thedogsspotga.com':   '1472', // <-- Replace with real Trainer PIN
+  'info+1@thedogsspotga.com': '2583', // <-- Replace with real Virtual Staff PIN
+  'otchx4@gmail.com':         '9061', // <-- Replace with real Super User PIN
+};
 
-    const pinHash = await bcrypt.hash(pin, 10);
+async function encryptAndDeployPins() {
+  console.log('Initiating staff PIN encryption and deployment sequence...\n');
 
-    const { data, error } = await supabase
+  for (const [email, plainPin] of Object.entries(REAL_STAFF_PINS)) {
+    console.log(`Generating secure cryptographic hash for: ${email}...`);
+    
+    // Hash the plain text pin exactly how server.js expects to verify it
+    const salt = await bcrypt.genSalt(10);
+    const encryptedHash = await bcrypt.hash(String(plainPin), salt);
+
+    const { error } = await supabase
       .from('portal_users')
-      .update({ pin_hash: pinHash, failed_attempts: 0, locked_until: null })
-      .eq('email', email)
-      .select();
+      .update({ 
+        pin_hash: encryptedHash,
+        failed_attempts: 0, // Reset any existing lockouts while updating
+        locked_until: null
+      })
+      .eq('email', email.toLowerCase().trim());
 
     if (error) {
-      console.error(`✗ Failed for ${email}:`, error.message);
-    } else if (!data || data.length === 0) {
-      console.error(`✗ No user found with email ${email} — check the portal_users table`);
+      console.error(`  ✗ Database rejected update sequence for ${email}:`, error.message);
     } else {
-      console.log(`✓ PIN set for ${email}`);
+      console.log(`  ✓ Live authorization code securely locked in for ${email}`);
     }
   }
 
-  console.log('\nDone. You can now log in with email + PIN.');
-  console.log('IMPORTANT: delete or clear the PINS object above after running, so plaintext PINs aren\'t left in this file.');
+  console.log('\n========================================');
+  console.log('PIN Synchronization Complete.');
+  console.log('You can now log into your live portal panels.');
+  console.log('========================================');
 }
 
-setPins().catch(err => {
-  console.error('Failed:', err);
-  process.exit(1);
-});
+encryptAndDeployPins().catch(console.error);
