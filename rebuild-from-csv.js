@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Rebuild Bookings from GHL UI CSV Export
+// The Dogs Spot — Rebuild Bookings via Chronological Execution Timeline
 // ============================================================
 require('dotenv').config();
 const fs = require('fs');
@@ -10,11 +10,12 @@ const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_KEY: process.env.SUPABASE_KEY,
   TIMEZONE: 'America/New_York',
+  CUTOFF_DATE: new Date('2026-05-01T00:00:00Z'),
+  MAX_STAY_DAYS: 30 // Protective ceiling limit to prevent cross-pairing over forgotten stays
 };
 
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 
-// Map text-based Calendar strings from UI export to Service Types and Roles
 const CALENDAR_TEXT_LOOKUP = {
   'boarding drop off':          { serviceType: 'boarding',    role: 'dropoff', source: 'internal' },
   'boarding drop off - online': { serviceType: 'boarding',    role: 'dropoff', source: 'online'   },
@@ -29,7 +30,8 @@ const CALENDAR_TEXT_LOOKUP = {
   'community drop off':         { serviceType: 'community',   role: 'dropoff', source: 'internal' },
   'community pick-up':          { serviceType: 'community',   role: 'pickup',  source: 'internal' },
   'bundle drop off':            { serviceType: 'bundle',      role: 'dropoff', source: 'internal' },
-  'bundle pick-up':             { serviceType: 'bundle',      role: 'pickup',  source: 'internal' }
+  'bundle pick-up':             { serviceType: 'bundle',      role: 'pickup',  source: 'internal' },
+  'bootcamp pick-up':           { serviceType: 'basic',       role: 'pickup',  source: 'internal' }
 };
 
 const PAIRING_GROUPS = {
@@ -49,19 +51,33 @@ function normalizePhone(phone) {
 
 function parseCSV(filePath) {
   const content = fs.readFileSync(filePath, 'utf8');
-  // Handle standard line split variants cleanly
   const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
   if (lines.length === 0) return [];
 
-  // Match columns even with loose spacing/invisible quote marks
-  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+  const parseLine = (line) => {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (char === '"') {
+        inQuotes = !inQuotes;
+      } else if (char === ',' && !inQuotes) {
+        result.push(current.trim().replace(/^"|"$/g, ''));
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    result.push(current.trim().replace(/^"|"$/g, ''));
+    return result;
+  };
+
+  const headers = parseLine(lines[0]);
   const records = [];
 
   for (let i = 1; i < lines.length; i++) {
-    // Robust regex split to handle fields wrapped in quotes containing internal commas safely
-    const matches = lines[i].match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g) || lines[i].split(',');
-    const values = matches.map(v => v.trim().replace(/^"|"$/g, ''));
-    
+    const values = parseLine(lines[i]);
     if (values.length !== headers.length) continue;
 
     const row = {};
@@ -85,63 +101,72 @@ async function runImport() {
     process.exit(1);
   }
 
-  const appointments = parseCSV(csvPath);
-  console.log(`Parsed ${appointments.length} raw appointments. Processing chronological pairing loops...`);
+  const rawAppointments = parseCSV(csvPath);
+  console.log(`Parsed ${rawAppointments.length} raw appointments from file.`);
 
-  // Order chronologically by Date Added to match linear session tracking sequence
-  appointments.sort((a, b) => new Date(a['Date added'] || 0) - new Date(b['Date added'] || 0));
+  const appointments = [];
+  let historicalPurgedCount = 0;
+
+  for (const appt of rawAppointments) {
+    const outcome = String(appt['Outcome'] || '').toLowerCase();
+    const apptDate = new Date(appt['Requested time'] || appt['Date added']);
+
+    if ((outcome === 'cancelled' || outcome === 'invalid') && apptDate < CONFIG.CUTOFF_DATE) {
+      historicalPurgedCount++;
+      continue;
+    }
+    appointments.push(appt);
+  }
+
+  console.log(`🧹 Deleted ${historicalPurgedCount} older canceled/invalid placeholder entries.`);
+
+  // FIXED: Sort strictly by physical execution date (Requested time) to implement your chronological timeline layout
+  appointments.sort((a, b) => new Date(a['Requested time'] || 0) - new Date(b['Requested time'] || 0));
 
   const stays = [];
-  const TWENTY_FOUR_HOURS_MS = 24 * 3600 * 1000;
+  const MAX_STAY_WINDOW_MS = CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000;
+  let discardedUnmatchedCount = 0;
 
   for (const appt of appointments) {
     const calString = String(appt['Calendar']).trim().toLowerCase();
     const calMeta = CALENDAR_TEXT_LOOKUP[calString];
     if (!calMeta) {
-      console.warn(`  ↳ Skipping unknown calendar label classification: "${appt['Calendar']}"`);
+      discardedUnmatchedCount++;
       continue;
     }
 
-    const { serviceType, role, source } = calMeta;
+    const role = calMeta.role;
+    const otherRole = role === 'dropoff' ? 'pickup' : 'dropoff';
+    const serviceType = calMeta.serviceType;
     const group = PAIRING_GROUPS[serviceType] || 'flexible';
-    const isDropoff = role === 'dropoff';
-    const missingField = isDropoff ? 'pickup' : 'dropoff';
 
     const ownerName = appt['Contact name'];
     const ownerEmail = appt['Email'] ? String(appt['Email']).trim().toLowerCase() : '';
     const normPhone = normalizePhone(appt['Phone']);
 
-    const apptBookedAtMs = new Date(appt['Date added']).getTime();
-
+    const currentApptTimeMs = new Date(appt['Requested time']).getTime();
     let bestMatch = null;
 
-    if (group === 'boarding') {
-      let minDiff = Infinity;
-      for (const stay of stays) {
-        // Validate matching markers when a genuine contact_id column is absent
-        const phoneMatch = normPhone && stay.phone === normPhone;
-        const emailMatch = ownerEmail && stay.email === ownerEmail;
-        const nameMatch = ownerName && stay.name.toLowerCase() === ownerName.toLowerCase();
+    // Direct Sequential Timeline Validation Matrix
+    for (const stay of stays) {
+      if (stay[role] || !stay[otherRole] || stay.group !== group) continue;
 
-        if (!(phoneMatch || emailMatch || nameMatch) || stay.group !== 'boarding' || stay[missingField]) continue;
+      const phoneMatch = normPhone && stay.phone === normPhone;
+      const emailMatch = ownerEmail && stay.email === ownerEmail;
+      const nameMatch = ownerName && stay.name.toLowerCase() === ownerName.toLowerCase();
+      if (!(phoneMatch || emailMatch || nameMatch)) continue;
 
-        const targetLeg = stay.dropoff || stay.pickup;
-        const targetBookedAtMs = new Date(targetLeg['Date added']).getTime();
-        const diff = Math.abs(targetBookedAtMs - apptBookedAtMs);
+      const targetLeg = stay[otherRole];
+      const targetLegTimeMs = new Date(targetLeg['Requested time']).getTime();
+      const timeDelta = Math.abs(currentApptTimeMs - targetLegTimeMs);
 
-        if (diff <= TWENTY_FOUR_HOURS_MS && diff < minDiff) {
-          minDiff = diff;
+      if (timeDelta <= MAX_STAY_WINDOW_MS) {
+        // Enforce the rule: Pick-up MUST always occur chronologically AFTER its paired Drop-off
+        if (role === 'pickup' && currentApptTimeMs >= targetLegTimeMs) {
           bestMatch = stay;
+          break; // Grab the closest open drop-off matching the condition
         }
-      }
-    } else {
-      // Flexible Pool FIFO Cross-Service Alignment
-      for (const stay of stays) {
-        const phoneMatch = normPhone && stay.phone === normPhone;
-        const emailMatch = ownerEmail && stay.email === ownerEmail;
-        const nameMatch = ownerName && stay.name.toLowerCase() === ownerName.toLowerCase();
-
-        if ((phoneMatch || emailMatch || nameMatch) && stay.group === 'flexible' && !stay[missingField]) {
+        if (role === 'dropoff' && currentApptTimeMs <= targetLegTimeMs) {
           bestMatch = stay;
           break;
         }
@@ -149,12 +174,8 @@ async function runImport() {
     }
 
     if (bestMatch) {
-      if (isDropoff) {
-        bestMatch.dropoff = appt;
-        bestMatch.serviceType = serviceType;
-      } else {
-        bestMatch.pickup = appt;
-      }
+      bestMatch[role] = appt;
+      if (role === 'dropoff') bestMatch.serviceType = serviceType;
       if (ownerEmail && !bestMatch.email) bestMatch.email = ownerEmail;
       if (normPhone && !bestMatch.phone) bestMatch.phone = normPhone;
     } else {
@@ -164,16 +185,30 @@ async function runImport() {
         phone: normPhone,
         serviceType,
         group,
-        dropoff: isDropoff ? appt : null,
-        pickup:  !isDropoff ? appt : null,
+        dropoff: role === 'dropoff' ? appt : null,
+        pickup:  role === 'pickup' ? appt : null,
       });
     }
   }
 
-  console.log(`\nProcessing upload arrays for ${stays.length} unified stays into Supabase...`);
+  let orphanedShowedPurgedCount = 0;
+  const filteredStays = stays.filter(stay => {
+    if (stay.group === 'boarding' && stay.dropoff && !stay.pickup) {
+      const dropoffOutcome = String(stay.dropoff['Outcome'] || '').toLowerCase();
+      if (dropoffOutcome === 'showed') {
+        orphanedShowedPurgedCount++;
+        return false;
+      }
+    }
+    return true;
+  });
+
+  console.log(`\n🧹 Dropped ${orphanedShowedPurgedCount} orphaned drop-offs that had no pick-up leg.`);
+  console.log(`📊 Processing final upload of ${filteredStays.length} chronological stays to Supabase...`);
+
   let inserted = 0; let errors = 0;
 
-  for (const stay of stays) {
+  for (const stay of filteredStays) {
     const { dropoff, pickup } = stay;
 
     let status = 'confirmed';
@@ -197,7 +232,7 @@ async function runImport() {
     const resolvedSource = (dropoffMeta?.source === 'online' || pickupMeta?.source === 'online') ? 'online' : 'internal';
 
     const payload = {
-      contact_id: 'PENDING_POST_SYNC', // Populated explicitly via follow-up profile matching query
+      contact_id: 'PENDING_POST_SYNC',
       owner_name: stay.name,
       owner_email: stay.email || null,
       owner_phone: stay.phone || null,
@@ -217,7 +252,7 @@ async function runImport() {
 
     const { error } = await supabase.from('boarding_stays').insert(payload);
     if (error) {
-      console.error(`  ✗ Database rejected entry for ${stay.name}:`, error.message);
+      console.error(`  ✗ Database rejection for ${stay.name}:`, error.message);
       errors++;
     } else {
       inserted++;
@@ -225,10 +260,17 @@ async function runImport() {
   }
 
   console.log(`\n========================================`);
-  console.log(`CSV Import Phase Complete.`);
-  console.log(`  Stays Rebuilt & Created: ${inserted}`);
-  console.log(`  Failed DB Submissions:  ${errors}`);
+  console.log(`Timeline Pairing Optimization Engine Concluded.`);
+  console.log(`  Stays Loaded into Supabase: ${inserted}`);
+  console.log(`  Database Failures:          ${errors}`);
   console.log(`========================================`);
 }
 
-runImport().catch(console.error);
+async function clearAndRun() {
+  console.log('Clearing past structural sync logs...');
+  await supabase.from('sync_log').delete().not('id', 'is', null);
+  await supabase.from('boarding_stays').delete().not('id', 'is', null);
+  await runImport();
+}
+
+clearAndRun().catch(console.error);
