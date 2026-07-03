@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Pure Live GHL Sync Backend (Kennel Fixed)
+// The Dogs Spot — Pure Live GHL Sync Backend (Fully Featured)
 // Node.js / Express — Deploy to Render or Railway
 // ============================================================
 
@@ -33,6 +33,7 @@ const CONFIG = {
   SUPABASE_KEY:   process.env.SUPABASE_KEY,    
   PORT:           process.env.PORT || 3000,
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  
+  TIMEZONE:       'America/New_York',
 
   CALENDARS: {
     boarding: {
@@ -74,7 +75,7 @@ const CONFIG = {
   },
 
   BOARDING_PAIRING_WINDOW_HOURS: 24,
-  MAX_STAY_DAYS: 90, 
+  MAX_STAY_DAYS: 90, // Extended 90-day support for long-term programs & bundles
   HEAL_INTERVAL_MS: 60000, 
   KENNEL_SIZE_FIELD_IDS: ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'], 
 };
@@ -103,6 +104,13 @@ function normalizePhone(phone) {
   const digits = String(phone).replace(/\D/g, '');
   if (!digits) return null;
   return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+}
+
+function getDateStringInTZ(date) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: CONFIG.TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  return formatter.format(date);
 }
 
 function resolveOwnerName(contact) {
@@ -257,7 +265,7 @@ async function getAllKennels() {
   return data || [];
 }
 
-// FIXED: Converts all ISO strings to exact Unix millisecond timestamps for 100% accurate availability mapping
+// Converts all ISO strings to exact Unix millisecond timestamps for accurate availability checking
 async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId) {
   if (!startDate || !endDate) return null; 
   const kennels = (await getAllKennels()).filter(k => k.type === kennelType);
@@ -328,7 +336,6 @@ async function processAppointment(payload, eventType) {
   const { serviceType, role, source } = calMeta;
   const existingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
   
-  // FIXED: Converts raw webhook times to standard UTC strings when saving/updating
   const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
   const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
 
@@ -395,10 +402,12 @@ async function processAppointment(payload, eventType) {
 // ------------------------------------------------------------
 async function autoHealTimelineQueue() {
   try {
+    // ENFORCED: Chained filters execute natively off of an explicit select parameters blueprint
     const { data: incompleteStays } = await supabase
       .from('boarding_stays')
+      .select('*')
       .eq('status', 'incomplete')
-      .not('contact_id', 'eq', 'LIVE_WEBHOOK_MATCH');
+      .neq('contact_id', 'LIVE_WEBHOOK_MATCH');
 
     if (!incompleteStays || incompleteStays.length === 0) return;
 
@@ -486,7 +495,9 @@ app.post('/webhook/ghl', async (req, res) => {
   }
 });
 
-// Portal Data Layer REST APIs
+// ------------------------------------------------------------
+// PORTAL DATA LAYER REST APIS 
+// ------------------------------------------------------------
 app.get('/api/stays', async (req, res) => {
   try {
     const { status, search } = req.query;
@@ -495,6 +506,33 @@ app.get('/api/stays', async (req, res) => {
     if (search) query = query.or(`owner_name.ilike.%${search}%,dog_name.ilike.%${search}%`);
     const { data } = await query;
     res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/dashboard/today', async (req, res) => {
+  try {
+    const today = getDateStringInTZ(new Date());
+    const { data: stays } = await supabase.from('boarding_stays').select('*').neq('status', 'cancelled');
+    const live = stays || [];
+    res.json({
+      date: today,
+      arrivals: live.filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === today),
+      departures: live.filter(s => s.end_date && getDateStringInTZ(new Date(s.end_date)) === today),
+      active: live.filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) <= today && (!s.end_date || getDateStringInTZ(new Date(s.end_date)) >= today)),
+      pending: live.filter(s => s.status === 'requested'),
+      incomplete: live.filter(s => s.status === 'incomplete'),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/stays/:id/kennel', async (req, res) => {
+  try {
+    const { kennel_id } = req.body;
+    const update = kennel_id 
+      ? { kennel_id, kennel_status: 'assigned', last_modified_source: 'portal', last_synced_at: new Date().toISOString() }
+      : { kennel_id: null, kennel_status: 'unassigned', last_modified_source: 'portal', last_synced_at: new Date().toISOString() };
+    await supabase.from('boarding_stays').update(update).eq('id', req.params.id);
+    res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
