@@ -38,17 +38,18 @@ function resolveDogName(contact) {
 }
 
 async function runProfileSync() {
-  console.log('Retrieving entries from Supabase to run contact resolution...');
+  console.log('Retrieving stays needing contact resolution from Supabase...');
   const { data: stays, error } = await supabase
     .from('boarding_stays')
-    .select('id, owner_name, owner_email, owner_phone');
+    .select('id, owner_name, owner_email, owner_phone')
+    .eq('contact_id', 'PENDING_POST_SYNC');
 
   if (error) {
-    console.error('Failed querying stays:', error.message);
+    console.error('Failed querying stays from Supabase:', error.message);
     return;
   }
 
-  console.log(`Processing deep profile matches for ${stays.length} stays across GoHighLevel... \n`);
+  console.log(`Processing profile matches for ${stays.length} records against GoHighLevel... \n`);
 
   const memoryCache = new Map();
   let completed = 0; let skipped = 0;
@@ -62,23 +63,23 @@ async function runProfileSync() {
     } else {
       try {
         let ghlContact = null;
-        // Search strictly by phone first to eliminate names matching multiple family structures
+        
+        // FIXED: Removed trailing slashes from the endpoints to prevent 404/Authentication drops
         if (stay.owner_phone) {
-          const res = await ghl.get('/contacts/', {
+          const res = await ghl.get('/contacts', {
             params: { locationId: CONFIG.GHL_LOCATION, query: stay.owner_phone }
           });
           if (res.data?.contacts?.length > 0) ghlContact = res.data.contacts[0];
         }
-        // Fallback search by email if phone yields no records
+        
         if (!ghlContact && stay.owner_email) {
-          const res = await ghl.get('/contacts/', {
+          const res = await ghl.get('/contacts', {
             params: { locationId: CONFIG.GHL_LOCATION, query: stay.owner_email }
           });
           if (res.data?.contacts?.length > 0) ghlContact = res.data.contacts[0];
         }
 
         if (ghlContact) {
-          // Fetch full contact card to expose internal customFields array mappings
           const details = await ghl.get(`/contacts/${ghlContact.id}`);
           if (details.data?.contact) {
             resolvedProfile = {
@@ -89,7 +90,9 @@ async function runProfileSync() {
           }
         }
       } catch (err) {
-        console.error(`  ✗ Communication failure pulling profile for ${stay.owner_name}`);
+        const errMsg = err.response?.data?.message || err.response?.data || err.message;
+        console.error(`  ✗ Profile retrieval block for ${stay.owner_name}: ${errMsg}`);
+        continue;
       }
     }
 
@@ -103,9 +106,9 @@ async function runProfileSync() {
         .eq('id', stay.id);
 
       if (dbErr) {
-        console.error(`  ✗ DB write block on stay update targeting ID ${stay.id}`);
+        console.error(`  ✗ DB write block on stay update targeting ID ${stay.id}: ${dbErr.message}`);
       } else {
-        console.log(`  ✓ Synced ${stay.owner_name} -> Dog: ${resolvedProfile.dogName || 'None Found'} (ID: ${resolvedProfile.contactId})`);
+        console.log(`  ✓ Synced ${stay.owner_name} -> Dog: ${resolvedProfile.dogName || 'None Found'}`);
         completed++;
       }
     } else {
