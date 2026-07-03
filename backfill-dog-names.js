@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Post-Import Dog Name Sync Engine
+// The Dogs Spot — Contact ID & Dog Name Post-Sync Processor
 // ============================================================
 require('dotenv').config();
 const axios = require('axios');
@@ -7,6 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 const CONFIG = {
   GHL_TOKEN:    process.env.GHL_TOKEN,
+  GHL_LOCATION: process.env.GHL_LOCATION,
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_KEY: process.env.SUPABASE_KEY,
 };
@@ -36,59 +37,76 @@ function resolveDogName(contact) {
   return null;
 }
 
-async function syncDogNames() {
-  console.log('Fetching stays missing dog names from Supabase...');
-  
-  // Pull all records to inspect or update
+async function runProfileSync() {
+  console.log('Retrieving entries from Supabase to run contact resolution...');
   const { data: stays, error } = await supabase
     .from('boarding_stays')
-    .select('id, contact_id, owner_name, dog_name');
+    .select('id, owner_name, owner_email, owner_phone');
 
   if (error) {
-    console.error('Failed to query Supabase:', error.message);
+    console.error('Failed querying stays:', error.message);
     return;
   }
 
-  console.log(`Found ${stays.length} records to verify. Querying GoHighLevel Profiles...\n`);
+  console.log(`Processing deep profile matches for ${stays.length} stays across GoHighLevel... \n`);
 
-  const contactMap = new Map();
-  let updated = 0;
-  let skipped = 0;
+  const memoryCache = new Map();
+  let completed = 0; let skipped = 0;
 
   for (const stay of stays) {
-    if (!stay.contact_id) {
-      skipped++;
-      continue;
-    }
+    const cacheKey = stay.owner_phone || stay.owner_email || stay.owner_name;
+    let resolvedProfile = null;
 
-    let dogName = null;
-
-    // Check memory cache first to avoid hammering the GHL API for repeat clients
-    if (contactMap.has(stay.contact_id)) {
-      dogName = contactMap.get(stay.contact_id);
+    if (memoryCache.has(cacheKey)) {
+      resolvedProfile = memoryCache.get(cacheKey);
     } else {
       try {
-        const res = await ghl.get(`/contacts/${stay.contact_id}`);
-        const contact = res.data?.contact || null;
-        dogName = resolveDogName(contact);
-        contactMap.set(stay.contact_id, dogName);
+        let ghlContact = null;
+        // Search strictly by phone first to eliminate names matching multiple family structures
+        if (stay.owner_phone) {
+          const res = await ghl.get('/contacts/', {
+            params: { locationId: CONFIG.GHL_LOCATION, query: stay.owner_phone }
+          });
+          if (res.data?.contacts?.length > 0) ghlContact = res.data.contacts[0];
+        }
+        // Fallback search by email if phone yields no records
+        if (!ghlContact && stay.owner_email) {
+          const res = await ghl.get('/contacts/', {
+            params: { locationId: CONFIG.GHL_LOCATION, query: stay.owner_email }
+          });
+          if (res.data?.contacts?.length > 0) ghlContact = res.data.contacts[0];
+        }
+
+        if (ghlContact) {
+          // Fetch full contact card to expose internal customFields array mappings
+          const details = await ghl.get(`/contacts/${ghlContact.id}`);
+          if (details.data?.contact) {
+            resolvedProfile = {
+              contactId: ghlContact.id,
+              dogName: resolveDogName(details.data.contact)
+            };
+            memoryCache.set(cacheKey, resolvedProfile);
+          }
+        }
       } catch (err) {
-        console.error(`  ✗ Failed fetching GHL profile for ${stay.owner_name} (${stay.contact_id})`);
-        continue;
+        console.error(`  ✗ Communication failure pulling profile for ${stay.owner_name}`);
       }
     }
 
-    if (dogName) {
-      const { error: updateErr } = await supabase
+    if (resolvedProfile) {
+      const { error: dbErr } = await supabase
         .from('boarding_stays')
-        .update({ dog_name: dogName })
+        .update({
+          contact_id: resolvedProfile.contactId,
+          dog_name: resolvedProfile.dogName
+        })
         .eq('id', stay.id);
 
-      if (updateErr) {
-        console.error(`  ✗ Failed updating dog name in DB for stay ID ${stay.id}`);
+      if (dbErr) {
+        console.error(`  ✗ DB write block on stay update targeting ID ${stay.id}`);
       } else {
-        console.log(`  ✓ Updated ${stay.owner_name}'s dog name -> ${dogName}`);
-        updated++;
+        console.log(`  ✓ Synced ${stay.owner_name} -> Dog: ${resolvedProfile.dogName || 'None Found'} (ID: ${resolvedProfile.contactId})`);
+        completed++;
       }
     } else {
       skipped++;
@@ -96,10 +114,10 @@ async function syncDogNames() {
   }
 
   console.log(`\n========================================`);
-  console.log(`Dog Name Sync Complete.`);
-  console.log(`  Records Updated:  ${updated}`);
-  console.log(`  Records Skipped:  ${skipped}`);
+  console.log(`Profile Backfill Sequence Concluded.`);
+  console.log(`  Stays Fully Resolved: ${completed}`);
+  console.log(`  Stays Left Unmatched: ${skipped}`);
   console.log(`========================================`);
 }
 
-syncDogNames().catch(console.error);
+runProfileSync().catch(console.error);
