@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Rebuild Bookings via Chronological Execution Timeline
+// The Dogs Spot — Safe-Upsert Chronological Timeline Engine
 // ============================================================
 require('dotenv').config();
 const fs = require('fs');
@@ -11,7 +11,7 @@ const CONFIG = {
   SUPABASE_KEY: process.env.SUPABASE_KEY,
   TIMEZONE: 'America/New_York',
   CUTOFF_DATE: new Date('2026-05-01T00:00:00Z'),
-  MAX_STAY_DAYS: 30 // Protective ceiling limit to prevent cross-pairing over forgotten stays
+  MAX_STAY_DAYS: 30 
 };
 
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
@@ -31,7 +31,9 @@ const CALENDAR_TEXT_LOOKUP = {
   'community pick-up':          { serviceType: 'community',   role: 'pickup',  source: 'internal' },
   'bundle drop off':            { serviceType: 'bundle',      role: 'dropoff', source: 'internal' },
   'bundle pick-up':             { serviceType: 'bundle',      role: 'pickup',  source: 'internal' },
-  'bootcamp pick-up':           { serviceType: 'basic',       role: 'pickup',  source: 'internal' }
+  
+  // Bootcamp Pick-up: Marked as 'bootcamp' initially to inherit paired drop-off type dynamically
+  'bootcamp pick-up':           { serviceType: 'bootcamp',    role: 'pickup',  source: 'internal' }
 };
 
 const PAIRING_GROUPS = {
@@ -41,6 +43,7 @@ const PAIRING_GROUPS = {
   leash_free:  'flexible',
   service_dog: 'flexible',
   community:   'flexible',
+  bootcamp:    'flexible'  
 };
 
 function normalizePhone(phone) {
@@ -118,9 +121,9 @@ async function runImport() {
     appointments.push(appt);
   }
 
-  console.log(`🧹 Deleted ${historicalPurgedCount} older canceled/invalid placeholder entries.`);
+  console.log(`\n🧹 Discarded ${historicalPurgedCount} old canceled/invalid historical entries.`);
 
-  // FIXED: Sort strictly by physical execution date (Requested time) to implement your chronological timeline layout
+  // Chronological Sort by Requested Time (Actual execution timeline)
   appointments.sort((a, b) => new Date(a['Requested time'] || 0) - new Date(b['Requested time'] || 0));
 
   const stays = [];
@@ -147,9 +150,12 @@ async function runImport() {
     const currentApptTimeMs = new Date(appt['Requested time']).getTime();
     let bestMatch = null;
 
-    // Direct Sequential Timeline Validation Matrix
+    // Timeline Pair Link Matching Loop
     for (const stay of stays) {
-      if (stay[role] || !stay[otherRole] || stay.group !== group) continue;
+      if (stay[role] || !stay[otherRole] || stay.group !== 'flexible') {
+        if (group === 'boarding' && stay.group !== 'boarding') continue;
+        if (group !== 'boarding' && stay.group === 'boarding') continue;
+      }
 
       const phoneMatch = normPhone && stay.phone === normPhone;
       const emailMatch = ownerEmail && stay.email === ownerEmail;
@@ -161,10 +167,9 @@ async function runImport() {
       const timeDelta = Math.abs(currentApptTimeMs - targetLegTimeMs);
 
       if (timeDelta <= MAX_STAY_WINDOW_MS) {
-        // Enforce the rule: Pick-up MUST always occur chronologically AFTER its paired Drop-off
         if (role === 'pickup' && currentApptTimeMs >= targetLegTimeMs) {
           bestMatch = stay;
-          break; // Grab the closest open drop-off matching the condition
+          break; 
         }
         if (role === 'dropoff' && currentApptTimeMs <= targetLegTimeMs) {
           bestMatch = stay;
@@ -175,7 +180,10 @@ async function runImport() {
 
     if (bestMatch) {
       bestMatch[role] = appt;
-      if (role === 'dropoff') bestMatch.serviceType = serviceType;
+      if (role === 'dropoff') {
+        bestMatch.serviceType = serviceType;
+        bestMatch.group = group;
+      }
       if (ownerEmail && !bestMatch.email) bestMatch.email = ownerEmail;
       if (normPhone && !bestMatch.phone) bestMatch.phone = normPhone;
     } else {
@@ -191,25 +199,26 @@ async function runImport() {
     }
   }
 
-  let orphanedShowedPurgedCount = 0;
+  // FIXED: Strict unconditional drop filter for ANY boarding stay missing its pick-up leg
+  let orphanedBoardingPurgedCount = 0;
   const filteredStays = stays.filter(stay => {
     if (stay.group === 'boarding' && stay.dropoff && !stay.pickup) {
-      const dropoffOutcome = String(stay.dropoff['Outcome'] || '').toLowerCase();
-      if (dropoffOutcome === 'showed') {
-        orphanedShowedPurgedCount++;
-        return false;
-      }
+      orphanedBoardingPurgedCount++;
+      return false; // Skips/deletes the stay entirely from the loading sequence
     }
     return true;
   });
 
-  console.log(`\n🧹 Dropped ${orphanedShowedPurgedCount} orphaned drop-offs that had no pick-up leg.`);
-  console.log(`📊 Processing final upload of ${filteredStays.length} chronological stays to Supabase...`);
+  console.log(`🧹 Strictly filtered out ${orphanedBoardingPurgedCount} total orphaned boarding drop-offs missing a pick-up.`);
+  console.log(`📊 Processing safe upsert validation for ${filteredStays.length} historical stays...`);
 
-  let inserted = 0; let errors = 0;
+  let inserted = 0; let updated = 0; let errors = 0;
 
   for (const stay of filteredStays) {
     const { dropoff, pickup } = stay;
+
+    let finalServiceType = stay.serviceType;
+    if (finalServiceType === 'bootcamp') finalServiceType = 'basic';
 
     let status = 'confirmed';
     if (!dropoff || !pickup) status = 'incomplete';
@@ -231,6 +240,9 @@ async function runImport() {
     const pickupMeta  = pickup  ? CALENDAR_TEXT_LOOKUP[String(pickup['Calendar']).trim().toLowerCase()] : null;
     const resolvedSource = (dropoffMeta?.source === 'online' || pickupMeta?.source === 'online') ? 'online' : 'internal';
 
+    const dropoffId = dropoff ? dropoff['Appointment id'] : null;
+    const pickupId = pickup ? pickup['Appointment id'] : null;
+
     const payload = {
       contact_id: 'PENDING_POST_SYNC',
       owner_name: stay.name,
@@ -239,38 +251,47 @@ async function runImport() {
       dog_name: null, 
       start_date: dropoffTimeStr ? new Date(dropoffTimeStr).toISOString() : null,
       end_date: pickupTimeStr ? new Date(pickupTimeStr).toISOString() : null,
-      service_type: stay.serviceType,
+      service_type: finalServiceType,
       status,
       source: resolvedSource,
-      ghl_dropoff_appointment_id: dropoff ? dropoff['Appointment id'] : null,
-      ghl_pickup_appointment_id: pickup ? pickup['Appointment id'] : null,
+      ghl_dropoff_appointment_id: dropoffId,
+      ghl_pickup_appointment_id: pickupId,
       kennel_status: 'needs_size',
       last_modified_source: 'portal',
       last_synced_at: new Date().toISOString(),
       ghl_date_added: dropoff ? new Date(dropoff['Date added']).toISOString() : new Date(pickup['Date added']).toISOString()
     };
 
-    const { error } = await supabase.from('boarding_stays').insert(payload);
-    if (error) {
-      console.error(`  ✗ Database rejection for ${stay.name}:`, error.message);
+    try {
+      let existingStay = null;
+      if (dropoffId) {
+        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_dropoff_appointment_id', dropoffId).limit(1);
+        if (data && data.length > 0) existingStay = data[0];
+      }
+      if (!existingStay && pickupId) {
+        const { data } = await supabase.from('boarding_stays').select('id').eq('ghl_pickup_appointment_id', pickupId).limit(1);
+        if (data && data.length > 0) existingStay = data[0];
+      }
+
+      if (existingStay) {
+        await supabase.from('boarding_stays').update(payload).eq('id', existingStay.id);
+        updated++;
+      } else {
+        await supabase.from('boarding_stays').insert(payload);
+        inserted++;
+      }
+    } catch (dbErr) {
+      console.error(`  ✗ Database sync error for ${stay.name}:`, dbErr.message);
       errors++;
-    } else {
-      inserted++;
     }
   }
 
   console.log(`\n========================================`);
-  console.log(`Timeline Pairing Optimization Engine Concluded.`);
-  console.log(`  Stays Loaded into Supabase: ${inserted}`);
-  console.log(`  Database Failures:          ${errors}`);
+  console.log(`Safe-Upsert Production Sync Concluded.`);
+  console.log(`  New Rows Created:     ${inserted}`);
+  console.log(`  Existing Rows Updated: ${updated}`);
+  console.log(`  Database Rejections:   ${errors}`);
   console.log(`========================================`);
 }
 
-async function clearAndRun() {
-  console.log('Clearing past structural sync logs...');
-  await supabase.from('sync_log').delete().not('id', 'is', null);
-  await supabase.from('boarding_stays').delete().not('id', 'is', null);
-  await runImport();
-}
-
-clearAndRun().catch(console.error);
+runImport().catch(console.error);
