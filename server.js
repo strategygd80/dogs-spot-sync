@@ -110,6 +110,46 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 }
 
 // ------------------------------------------------------------
+// CONTACT WEBHOOK DETECTION
+// Distinguishes a Contact Created/Updated event from an appointment
+// event. Handles both the standard Settings → Webhooks format
+// (explicit type: 'ContactUpdate'/'ContactCreate') and a Workflow →
+// "Contact Changed" trigger piped through a generic Webhook action
+// (no type field, but has contact identity fields and no
+// appointment/calendar signal at all).
+// ------------------------------------------------------------
+function isContactWebhook(body) {
+  const type = body.type || body.eventType || body.event || body.eventName;
+  if (type && /contact/i.test(type)) return true;
+
+  const hasAppointmentSignal =
+    (body.calendar && body.calendar.appointmentId) ||
+    body.appointmentId || body.appointment_id ||
+    body.calendarId || body.calendar_id;
+  if (hasAppointmentSignal) return false;
+
+  const hasContactIdentity =
+    body.contact_id || body.contactId ||
+    body.email || body.phone ||
+    body.first_name || body.firstName;
+  return Boolean(hasContactIdentity);
+}
+
+// ------------------------------------------------------------
+// PHONE NORMALISATION
+// GHL can return phone numbers in different formats depending on
+// booking source ("+1 361-533-2202" vs "3615332202" vs "(361) 533-2202").
+// Strip everything but digits, and drop a leading US country code, so
+// the same real phone number always compares equal.
+// ------------------------------------------------------------
+function normalizePhone(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/\D/g, '');
+  if (!digits) return null;
+  return digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
+}
+
+// ------------------------------------------------------------
 // PAIRING GROUPS
 // 'boarding' only pairs dropoff<->pickup within itself.
 // The other five service types share one pool: a dropoff on any
@@ -345,7 +385,8 @@ async function isReturningClient(contactId) {
 // ------------------------------------------------------------
 const BOARDING_PAIRING_WINDOW_HOURS = 24;
 
-async function findPairableStay(contactId, appointmentBookedAt, role, serviceType) {
+async function findPairableStay(identity, appointmentBookedAt, role, serviceType) {
+  const { contactId, phone, email } = identity;
   const group = pairingGroupOf(serviceType);
 
   // The field that must be NULL — we are filling in the missing half.
@@ -356,10 +397,16 @@ async function findPairableStay(contactId, appointmentBookedAt, role, serviceTyp
     ? 'ghl_dropoff_appointment_id'  // we are the dropoff; find row still missing its dropoff
     : 'ghl_pickup_appointment_id';  // we are the pickup;  find row still missing its pickup
 
+  // NOTE: we intentionally do NOT filter by contact_id in the query.
+  // GHL can create a separate contact record for the same real person
+  // depending on how they booked (online vs. in-person, repeat visit
+  // entered slightly differently, etc.), so contact_id alone is not a
+  // reliable identity match. Instead we pull every structurally-eligible
+  // candidate (status/service-group/missing-leg/time-window) and match
+  // on phone first, email second, contact_id only as a last resort.
   let query = supabase
     .from('boarding_stays')
     .select('*')
-    .eq('contact_id', contactId)
     .eq('status', 'incomplete')
     .in('service_type', serviceTypesInGroup(serviceType))
     .is(missingField, null);
@@ -379,10 +426,110 @@ async function findPairableStay(contactId, appointmentBookedAt, role, serviceTyp
     query = query.order('ghl_date_added', { ascending: true });
   }
 
-  const { data, error } = await query.limit(1);
-
+  const { data, error } = await query;
   if (error || !data || data.length === 0) return null;
-  return data[0];
+
+  const normPhone = normalizePhone(phone);
+  const normEmail = email ? String(email).trim().toLowerCase() : null;
+
+  if (normPhone) {
+    const byPhone = data.find(row => normalizePhone(row.owner_phone) === normPhone);
+    if (byPhone) return byPhone;
+  }
+
+  if (normEmail) {
+    const byEmail = data.find(row => row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail);
+    if (byEmail) return byEmail;
+  }
+
+  if (contactId) {
+    const byContactId = data.find(row => row.contact_id === contactId);
+    if (byContactId) return byContactId;
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// FIND ALL STAYS FOR A CONTACT (used by contact-update sync)
+// Same phone-first / email-second / contact_id-fallback identity
+// matching as findPairableStay, but returns EVERY matching stay
+// regardless of status — a contact update should refresh every
+// stay ever linked to that person (past, present, and incomplete),
+// not just open ones.
+//
+// NOTE: matches in JS rather than in the Supabase query, since phone
+// comparison needs normalisation Postgres can't do without a stored
+// normalised column. Fine at this business's data volume; worth
+// adding an indexed normalised-phone column if the stays table grows
+// large enough for a full-table fetch to become slow.
+// ------------------------------------------------------------
+async function findStaysForContact({ contactId, phone, email }) {
+  const normPhone = normalizePhone(phone);
+  const normEmail = email ? String(email).trim().toLowerCase() : null;
+  if (!normPhone && !normEmail && !contactId) return [];
+
+  const { data, error } = await supabase.from('boarding_stays').select('*');
+  if (error || !data) return [];
+
+  return data.filter(row => {
+    if (normPhone && normalizePhone(row.owner_phone) === normPhone) return true;
+    if (normEmail && row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail) return true;
+    if (contactId && row.contact_id === contactId) return true;
+    return false;
+  });
+}
+
+// ------------------------------------------------------------
+// PROCESS CONTACT UPDATE
+// Fired when a GHL contact is created/updated. Refreshes owner and
+// dog info on every stay ever linked to that contact (matched by
+// phone/email — see findStaysForContact). GHL is treated as the
+// source of truth: any field GHL sends a usable value for overwrites
+// what's in Supabase, INCLUDING manual staff edits made in the
+// portal. Fields GHL doesn't include a value for in this particular
+// payload are left untouched (not blanked out).
+// ------------------------------------------------------------
+async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
+  const dogName    = resolveDogName(_flatContact);
+  const kennelCat  = resolveKennelCategory(null, _flatContact);
+
+  const stays = await findStaysForContact({ contactId, phone, email });
+  if (stays.length === 0) {
+    console.log(`Contact update for ${contactId}: no linked stays found, nothing to sync`);
+    return;
+  }
+
+  const fieldUpdate = {};
+  if (ownerName) fieldUpdate.owner_name  = ownerName;
+  if (email)     fieldUpdate.owner_email = email;
+  if (phone)     fieldUpdate.owner_phone = phone;
+  if (dogName)   fieldUpdate.dog_name    = dogName;
+  if (kennelCat) {
+    fieldUpdate.kennel_type       = kennelCat.kennel_type;
+    fieldUpdate.kennel_grad_status = kennelCat.kennel_grad_status;
+  }
+
+  if (Object.keys(fieldUpdate).length === 0) {
+    console.log(`Contact update for ${contactId}: no usable fields in payload, nothing to sync`);
+    return;
+  }
+
+  fieldUpdate.last_modified_source = 'ghl';
+  fieldUpdate.last_synced_at = new Date().toISOString();
+
+  for (const stay of stays) {
+    await supabase.from('boarding_stays').update(fieldUpdate).eq('id', stay.id);
+    // Only re-run kennel assignment for stays that are still
+    // operationally relevant — no point reshuffling kennels for a
+    // stay that already completed or was cancelled.
+    if (['incomplete', 'confirmed', 'requested', 'active'].includes(stay.status)) {
+      await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', err.message));
+    }
+    await logSync({ stayId: stay.id, ghlAppointmentId: null, direction: 'ghl_to_db', action: 'contact_updated', payload: _flatContact });
+  }
+
+  console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
 }
 
 // ------------------------------------------------------------
@@ -613,19 +760,31 @@ async function processAppointment(payload, eventType) {
     return;
   }
 
+  // Resolve contact once, early — needed both for the phone/email
+  // identity match below and for name/kennel field resolution further
+  // down. Reused throughout so we never hit the GHL API twice for the
+  // same webhook event. Prefer prefilled workflow data; only fall back
+  // to an API call if something we need (phone, email, or dog name)
+  // wasn't already present in the webhook payload.
+  const needsContactLookup = !prefilled || !prefilled.phone || !prefilled.email || !resolveDogName(_flatContact);
+  const contact = needsContactLookup ? await getContact(contactId).catch(() => null) : null;
+  const ownerPhone = prefilled?.phone || contact?.phone || null;
+  const ownerEmail = prefilled?.email || contact?.email || null;
+
   // NEW appointment — try to pair with existing incomplete stay.
-  // Pass the GHL dateAdded timestamp so pairing is based on when the
-  // customer booked both appointments (same session), not when our
-  // webhooks happened to fire.
-  const pairableStay = await findPairableStay(contactId, appointmentBookedAt, role, serviceType);
+  // Match on phone/email identity (contact_id is only a fallback — see
+  // findPairableStay). Pass the GHL dateAdded timestamp so pairing is
+  // based on when the customer booked both appointments (same session),
+  // not when our webhooks happened to fire.
+  const pairableStay = await findPairableStay(
+    { contactId, phone: ownerPhone, email: ownerEmail },
+    appointmentBookedAt,
+    role,
+    serviceType
+  );
 
   if (pairableStay) {
     // PAIR: merge this appointment into existing incomplete stay
-    // Use prefilled contact data from workflow webhook if available,
-    // fall back to a GHL API call only when needed.
-    const contact = (!prefilled || !resolveDogName(_flatContact))
-      ? await getContact(contactId).catch(() => null)
-      : null;
     const status  = await determineStatus(source, contactId);
 
     const updatePayload = {
@@ -644,8 +803,8 @@ async function processAppointment(payload, eventType) {
       last_synced_at: new Date().toISOString(),
       // Fill contact info — prefer flat webhook fields, fall back to API
       owner_name:  pairableStay.owner_name  || prefilled?.name  || resolveOwnerName(contact),
-      owner_email: pairableStay.owner_email || prefilled?.email || contact?.email || null,
-      owner_phone: pairableStay.owner_phone || prefilled?.phone || contact?.phone || null,
+      owner_email: pairableStay.owner_email || ownerEmail,
+      owner_phone: pairableStay.owner_phone || ownerPhone,
       dog_name:    pairableStay.dog_name    || resolveDogName(_flatContact) || resolveDogName(contact),
       // Keep the earliest dateAdded — the first leg of the pair was booked
       // at this moment; the second leg may be fractionally later.
@@ -665,17 +824,11 @@ async function processAppointment(payload, eventType) {
     console.log(`Paired ${role} appointment into stay ${pairableStay.id}`);
   } else {
     // CREATE new incomplete stay (first half of pair)
-    // Use prefilled contact data from workflow webhook if available,
-    // fall back to a GHL API call only when needed.
-    const contact = (!prefilled || !resolveDogName(_flatContact))
-      ? await getContact(contactId).catch(() => null)
-      : null;
-
     const insertPayload = {
       contact_id:   contactId,
       owner_name:   prefilled?.name  || resolveOwnerName(contact),
-      owner_email:  prefilled?.email || contact?.email || null,
-      owner_phone:  prefilled?.phone || contact?.phone || null,
+      owner_email:  ownerEmail,
+      owner_phone:  ownerPhone,
       dog_name:     resolveDogName(_flatContact) || resolveDogName(contact),
       source,
       service_type: serviceType,
@@ -770,6 +923,35 @@ app.post('/webhook/ghl', async (req, res) => {
   console.log('RAW WEBHOOK BODY:', JSON.stringify(req.body, null, 2));
 
   const body = req.body;
+
+  // ── CONTACT WEBHOOK (Contact Created/Updated) ─────────────────────
+  // Handled separately from appointment events — refreshes owner/dog
+  // info across every stay linked to this contact rather than
+  // creating or pairing an appointment.
+  if (isContactWebhook(body)) {
+    const contactId  = body.contactId || body.contact_id || body.id;
+    const phone       = body.phone;
+    const email       = body.email;
+    const ownerName   = body.full_name || body.fullName ||
+      [body.first_name || body.firstName, body.last_name || body.lastName].filter(Boolean).join(' ') || null;
+
+    console.log(`Contact webhook received — contactId: ${contactId}`);
+
+    try {
+      await processContactUpdate({ contactId, phone, email, ownerName, _flatContact: body });
+    } catch (err) {
+      console.error('Webhook processing error for ContactUpdate:', err.message);
+      await logSync({
+        ghlAppointmentId: null,
+        direction: 'ghl_to_db',
+        action: 'contact_updated',
+        payload: body,
+        status: 'failed',
+        errorMessage: err.message,
+      });
+    }
+    return;
+  }
 
   // ── NORMALISE GHL WEBHOOK FORMAT ──────────────────────────────────
   // GHL sends two very different shapes depending on how the webhook
