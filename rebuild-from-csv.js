@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Safe-Upsert Chronological Timeline Engine
+// The Dogs Spot — Bulletproof Safe-Upsert Chronological Engine
 // ============================================================
 require('dotenv').config();
 const fs = require('fs');
@@ -31,8 +31,6 @@ const CALENDAR_TEXT_LOOKUP = {
   'community pick-up':          { serviceType: 'community',   role: 'pickup',  source: 'internal' },
   'bundle drop off':            { serviceType: 'bundle',      role: 'dropoff', source: 'internal' },
   'bundle pick-up':             { serviceType: 'bundle',      role: 'pickup',  source: 'internal' },
-  
-  // Bootcamp Pick-up: Marked as 'bootcamp' initially to inherit paired drop-off type dynamically
   'bootcamp pick-up':           { serviceType: 'bootcamp',    role: 'pickup',  source: 'internal' }
 };
 
@@ -111,6 +109,7 @@ async function runImport() {
   let historicalPurgedCount = 0;
 
   for (const appt of rawAppointments) {
+    if (!appt) continue;
     const outcome = String(appt['Outcome'] || '').toLowerCase();
     const apptDate = new Date(appt['Requested time'] || appt['Date added']);
 
@@ -131,7 +130,8 @@ async function runImport() {
   let discardedUnmatchedCount = 0;
 
   for (const appt of appointments) {
-    const calString = String(appt['Calendar']).trim().toLowerCase();
+    if (!appt) continue;
+    const calString = appt['Calendar'] ? String(appt['Calendar']).trim().toLowerCase() : '';
     const calMeta = CALENDAR_TEXT_LOOKUP[calString];
     if (!calMeta) {
       discardedUnmatchedCount++;
@@ -143,27 +143,33 @@ async function runImport() {
     const serviceType = calMeta.serviceType;
     const group = PAIRING_GROUPS[serviceType] || 'flexible';
 
-    const ownerName = appt['Contact name'];
+    const ownerName = appt['Contact name'] || 'Unknown';
     const ownerEmail = appt['Email'] ? String(appt['Email']).trim().toLowerCase() : '';
     const normPhone = normalizePhone(appt['Phone']);
 
-    const currentApptTimeMs = new Date(appt['Requested time']).getTime();
+    const currentApptTimeMs = appt['Requested time'] ? new Date(appt['Requested time']).getTime() : 0;
     let bestMatch = null;
 
     // Timeline Pair Link Matching Loop
     for (const stay of stays) {
-      if (stay[role] || !stay[otherRole] || stay.group !== 'flexible') {
-        if (group === 'boarding' && stay.group !== 'boarding') continue;
-        if (group !== 'boarding' && stay.group === 'boarding') continue;
-      }
+      if (!stay) continue;
+      
+      // FIXED: The leg space for the current role MUST be vacant, and the opposite leg MUST be occupied
+      if (stay[role] || !stay[otherRole]) continue;
+      
+      // Group validation barrier setup
+      if (group === 'boarding' && stay.group !== 'boarding') continue;
+      if (group !== 'boarding' && stay.group === 'boarding') continue;
 
       const phoneMatch = normPhone && stay.phone === normPhone;
       const emailMatch = ownerEmail && stay.email === ownerEmail;
-      const nameMatch = ownerName && stay.name.toLowerCase() === ownerName.toLowerCase();
+      const nameMatch = ownerName && stay.name && stay.name.toLowerCase() === ownerName.toLowerCase();
       if (!(phoneMatch || emailMatch || nameMatch)) continue;
 
       const targetLeg = stay[otherRole];
-      const targetLegTimeMs = new Date(targetLeg['Requested time']).getTime();
+      if (!targetLeg) continue; 
+      
+      const targetLegTimeMs = targetLeg['Requested time'] ? new Date(targetLeg['Requested time']).getTime() : 0;
       const timeDelta = Math.abs(currentApptTimeMs - targetLegTimeMs);
 
       if (timeDelta <= MAX_STAY_WINDOW_MS) {
@@ -199,12 +205,13 @@ async function runImport() {
     }
   }
 
-  // FIXED: Strict unconditional drop filter for ANY boarding stay missing its pick-up leg
+  // Strict unconditional drop filter for ANY boarding stay missing its pick-up leg
   let orphanedBoardingPurgedCount = 0;
   const filteredStays = stays.filter(stay => {
+    if (!stay) return false;
     if (stay.group === 'boarding' && stay.dropoff && !stay.pickup) {
       orphanedBoardingPurgedCount++;
-      return false; // Skips/deletes the stay entirely from the loading sequence
+      return false; 
     }
     return true;
   });
@@ -215,17 +222,22 @@ async function runImport() {
   let inserted = 0; let updated = 0; let errors = 0;
 
   for (const stay of filteredStays) {
+    if (!stay) continue;
     const { dropoff, pickup } = stay;
 
     let finalServiceType = stay.serviceType;
     if (finalServiceType === 'bootcamp') finalServiceType = 'basic';
 
+    let isCancelled = false;
+    if (dropoff && dropoff['Outcome'] && String(dropoff['Outcome']).toLowerCase() === 'cancelled') isCancelled = true;
+    if (pickup && pickup['Outcome'] && String(pickup['Outcome']).toLowerCase() === 'cancelled') isCancelled = true;
+
     let status = 'confirmed';
     if (!dropoff || !pickup) status = 'incomplete';
-    if (dropoff?.['Outcome'] === 'cancelled' || pickup?.['Outcome'] === 'cancelled') status = 'cancelled';
+    if (isCancelled) status = 'cancelled';
 
-    const dropoffTimeStr = dropoff ? dropoff['Requested time'] : null;
-    const pickupTimeStr = pickup ? pickup['Requested time'] : null;
+    const dropoffTimeStr = (dropoff && dropoff['Requested time']) ? dropoff['Requested time'] : null;
+    const pickupTimeStr = (pickup && pickup['Requested time']) ? pickup['Requested time'] : null;
 
     const todayStr = getDateStringInTZ(new Date(), CONFIG.TIMEZONE);
     const startStr = dropoffTimeStr ? getDateStringInTZ(new Date(dropoffTimeStr), CONFIG.TIMEZONE) : null;
@@ -236,16 +248,25 @@ async function runImport() {
       else if (endStr < todayStr) status = 'completed';
     }
 
-    const dropoffMeta = dropoff ? CALENDAR_TEXT_LOOKUP[String(dropoff['Calendar']).trim().toLowerCase()] : null;
-    const pickupMeta  = pickup  ? CALENDAR_TEXT_LOOKUP[String(pickup['Calendar']).trim().toLowerCase()] : null;
-    const resolvedSource = (dropoffMeta?.source === 'online' || pickupMeta?.source === 'online') ? 'online' : 'internal';
+    const dropoffCal = (dropoff && dropoff['Calendar']) ? String(dropoff['Calendar']).trim().toLowerCase() : '';
+    const pickupCal = (pickup && pickup['Calendar']) ? String(pickup['Calendar']).trim().toLowerCase() : '';
+
+    const dropoffMeta = dropoffCal ? CALENDAR_TEXT_LOOKUP[dropoffCal] : null;
+    const pickupMeta  = pickupCal ? CALENDAR_TEXT_LOOKUP[pickupCal] : null;
+    const resolvedSource = ((dropoffMeta && dropoffMeta.source === 'online') || (pickupMeta && pickupMeta.source === 'online')) ? 'online' : 'internal';
 
     const dropoffId = dropoff ? dropoff['Appointment id'] : null;
     const pickupId = pickup ? pickup['Appointment id'] : null;
 
+    let rawDateAdded = null;
+    if (dropoff && dropoff['Date added']) rawDateAdded = dropoff['Date added'];
+    else if (pickup && pickup['Date added']) rawDateAdded = pickup['Date added'];
+    
+    const ghlDateAddedIso = rawDateAdded ? new Date(rawDateAdded).toISOString() : new Date().toISOString();
+
     const payload = {
       contact_id: 'PENDING_POST_SYNC',
-      owner_name: stay.name,
+      owner_name: stay.name || 'Unknown',
       owner_email: stay.email || null,
       owner_phone: stay.phone || null,
       dog_name: null, 
@@ -259,7 +280,7 @@ async function runImport() {
       kennel_status: 'needs_size',
       last_modified_source: 'portal',
       last_synced_at: new Date().toISOString(),
-      ghl_date_added: dropoff ? new Date(dropoff['Date added']).toISOString() : new Date(pickup['Date added']).toISOString()
+      ghl_date_added: ghlDateAddedIso
     };
 
     try {
@@ -281,7 +302,7 @@ async function runImport() {
         inserted++;
       }
     } catch (dbErr) {
-      console.error(`  ✗ Database sync error for ${stay.name}:`, dbErr.message);
+      console.error(`  ✗ Database sync error for ${stay.name || 'Unknown'}:`, dbErr.message || dbErr);
       errors++;
     }
   }
