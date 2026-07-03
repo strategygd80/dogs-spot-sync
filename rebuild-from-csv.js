@@ -1,422 +1,99 @@
 // ============================================================
-// REBUILD boarding_stays FROM GHL CSV EXPORT
+// The Dogs Spot — Rebuild Bookings from Clean CSV
 // ============================================================
-// Why this exists: the live-API-based backfill/pairing logic in
-// backfill.js and server.js was mis-threading frequent repeat
-// customers (e.g. weekly boarders) — pairing a dropoff with the
-// WRONG week's pickup, leaving real appointments orphaned as
-// "incomplete" even though every appointment was legitimate.
-//
-// This script sidesteps that entirely by using a CSV export
-// straight from GHL (Reporting > Appointments > Export), which
-// has stable appointment IDs, real timestamps, and calendar
-// names already labeled. Pairing here is done by strict
-// chronological alternation per contact: for each contact, walk
-// their boarding-type appointments in time order and pair
-// dropoff -> pickup -> dropoff -> pickup, etc. This is much more
-// reliable than "closest in time within a window" for someone
-// who boards weekly.
-//
-// This is a FULL REBUILD: it deletes existing rows in
-// boarding_stays that originated from sync (last_modified_source
-// = 'ghl' or 'csv_rebuild') and reinserts fresh ones from the
-// CSV. Rows with last_modified_source = 'portal' (i.e. anything
-// staff edited by hand in the app) are left untouched.
-//
-// Usage:
-//   node rebuild-from-csv.js path/to/export.csv --dry-run
-//   node rebuild-from-csv.js path/to/export.csv
-// ============================================================
-
 require('dotenv').config();
 const fs = require('fs');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
-
-const DRY_RUN = process.argv.includes('--dry-run');
-const csvPath = process.argv[2];
-
-if (!csvPath || csvPath === '--dry-run') {
-  console.error('Usage: node rebuild-from-csv.js path/to/export.csv [--dry-run]');
-  process.exit(1);
-}
 
 const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_KEY: process.env.SUPABASE_KEY,
-  TIMEZONE: 'America/New_York',
 };
 
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 
-// ------------------------------------------------------------
-// CALENDAR NAME -> { serviceType, role, pairingGroup }
-// Only boarding-type calendars are handled here. Anything else
-// (Meet & Greet, training, daycare, pack walks, etc.) is ignored
-// entirely — it's not a boarding stay.
-// ------------------------------------------------------------
-const CALENDAR_MAP = {
-  // ── BOARDING (paired by proximity — same booking session) ──
-  'Boarding Drop Off':          { serviceType: 'boarding',    role: 'dropoff' },
-  'Boarding Drop Off - Online': { serviceType: 'boarding',    role: 'dropoff' },
-  'Boarding Pick Up':           { serviceType: 'boarding',    role: 'pickup'  },
-  'Boarding Pick Up - Online':  { serviceType: 'boarding',    role: 'pickup'  },
+// Simple native CSV parser line splitter to avoid external dependencies
+function parseCSV(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
+  if (lines.length === 0) return [];
 
-  // ── FLEXIBLE (paired FIFO across any type in the group) ──
-  'Basic Drop Off':             { serviceType: 'basic',       role: 'dropoff' },
-  'Basic Pick-up':              { serviceType: 'basic',       role: 'pickup'  },
-  'Bundle Drop Off':            { serviceType: 'bundle',      role: 'dropoff' },
-  'Bundle Pick-up':             { serviceType: 'bundle',      role: 'pickup'  },
-  'Leash Free Drop Off':        { serviceType: 'leash_free',  role: 'dropoff' },
-  'Leash Free Pick-up':         { serviceType: 'leash_free',  role: 'pickup'  },
-  'Service Dog Drop Off':       { serviceType: 'service_dog', role: 'dropoff' },
-  'Service Dog Pick-up':        { serviceType: 'service_dog', role: 'pickup'  },
-  'Community Drop Off':         { serviceType: 'community',   role: 'dropoff' },
-  'Community Pick-up':          { serviceType: 'community',   role: 'pickup'  },
-  'Bootcamp Pick-up':           { serviceType: 'community',   role: 'pickup'  },
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+  const records = [];
 
-  // ── INTENTIONALLY IGNORED — not dropoff/pickup stays ──
-  // These are standalone appointments (consultations, events, lessons)
-  // that don't map to a boarding stay and are skipped during import.
-  'Meet & Greet':                          null,
-  'P.U.P.S Club Community lesson':         null,
-  'Free Dog Training Day':                 null,
-  'Free Training Consultation (Facility)': null,
-};
+  for (let i = 1; i < lines.length; i++) {
+    // Basic comma-split logic (assumes data doesn't contain internal commas)
+    const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+    if (values.length !== headers.length) continue;
 
-const PAIRING_GROUPS = {
-  boarding:    'boarding',
-  basic:       'flexible',
-  bundle:      'flexible',
-  leash_free:  'flexible',
-  service_dog: 'flexible',
-  community:   'flexible',
-};
-function pairingGroupOf(serviceType) {
-  return PAIRING_GROUPS[serviceType] || serviceType;
-}
-
-const EXCLUDED_OUTCOMES = new Set(['cancelled', 'invalid', 'noshow']);
-
-// ------------------------------------------------------------
-// CSV PARSING (minimal, no external dependency)
-// Handles quoted fields containing commas, per RFC 4180.
-// ------------------------------------------------------------
-function parseCSV(text) {
-  const rows = [];
-  let row = [];
-  let field = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    const next = text[i + 1];
-
-    if (inQuotes) {
-      if (c === '"' && next === '"') { field += '"'; i++; }
-      else if (c === '"') { inQuotes = false; }
-      else { field += c; }
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ',') { row.push(field); field = ''; }
-      else if (c === '\r') { /* skip */ }
-      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
-      else { field += c; }
-    }
+    const row = {};
+    headers.forEach((header, idx) => {
+      row[header] = values[idx] || null;
+    });
+    records.push(row);
   }
-  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
-  return rows.filter(r => r.length > 1 || (r.length === 1 && r[0] !== ''));
+  return records;
 }
 
-function parseRequestedTime(str) {
-  // Format: "Jul 20 2026 09:10 AM"
-  const d = new Date(str);
-  if (isNaN(d.getTime())) return null;
-  return d;
-}
-
-function getDateStringInTZ(date, timeZone) {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-  });
-  return formatter.format(date);
-}
-
-// ------------------------------------------------------------
-// MAIN
-// ------------------------------------------------------------
-async function main() {
-  console.log(DRY_RUN ? 'Starting CSV rebuild (DRY RUN)...\n' : 'Starting CSV rebuild...\n');
-
-  const raw = fs.readFileSync(csvPath, 'utf-8').replace(/^\uFEFF/, ''); // strip BOM
-  const table = parseCSV(raw);
-  const header = table[0];
-  const dataRows = table.slice(1);
-
-  const col = name => header.indexOf(name);
-  const idxId       = col('Appointment id');
-  const idxTime      = col('Requested time');
-  const idxContact   = col('Contact name');
-  const idxCalendar  = col('Calendar');
-  const idxEmail     = col('Email');
-  const idxPhone     = col('Phone');
-  const idxOutcome   = col('Outcome');
-  const idxDogName   = col('Dog Name');   // present in newer exports; -1 means absent (gracefully ignored)
-  // GHL exports this column as "ghl_date_added" (the booking timestamp).
-  // Older exports may call it "Date added". Accept either so the script
-  // works regardless of which export format is used.
-  const idxDateAdded = col('ghl_date_added') !== -1 ? col('ghl_date_added') : col('Date added');
-
-  if ([idxId, idxTime, idxContact, idxCalendar, idxOutcome].some(i => i === -1)) {
-    console.error('CSV is missing one or more expected columns. Found header:', header);
+async function runImport() {
+  const csvPath = path.join(__dirname, 'stays.csv');
+  if (!fs.existsSync(csvPath)) {
+    console.error(`Error: Could not find 'stays.csv' in ${__dirname}`);
     process.exit(1);
   }
 
-  console.log(`Parsed ${dataRows.length} rows from CSV.\n`);
+  const rows = parseCSV(csvPath);
+  console.log(`Parsed ${rows.length} records from CSV. Starting database insertion...\n`);
 
-  // Step 1: filter to boarding-type calendars only, exclude cancelled/invalid/noshow
-  const relevant = [];
-  const unknownCalendars = new Set(); // calendars not in CALENDAR_MAP at all — printed as warnings
-  for (const r of dataRows) {
-    const calendarName = (r[idxCalendar] || '').trim();
-    const calMeta = CALENDAR_MAP[calendarName];
-    // null  = explicitly listed as ignored (Meet & Greet, events, etc.) — skip silently
-    // undefined = not in the map at all — log a warning so missing calendars are visible
-    if (calMeta === null) continue;
-    if (calMeta === undefined) {
-      unknownCalendars.add(calendarName);
-      continue;
-    }
+  let inserted = 0;
+  let errors = 0;
 
-    const outcome = (r[idxOutcome] || '').trim().toLowerCase();
-    if (EXCLUDED_OUTCOMES.has(outcome)) continue;
+  for (const row of rows) {
+    const payload = {
+      contact_id: row.contact_id,
+      owner_name: row.owner_name,
+      owner_email: row.owner_email,
+      owner_phone: row.owner_phone,
+      start_date: row.start_date ? new Date(row.start_date).toISOString() : null,
+      end_date: row.end_date ? new Date(row.end_date).toISOString() : null,
+      service_type: row.service_type || 'boarding',
+      status: row.status || 'confirmed',
+      source: row.source || 'internal',
+      ghl_dropoff_appointment_id: row.ghl_dropoff_id || null,
+      ghl_pickup_appointment_id: row.ghl_pickup_id || null,
+      kennel_type: row.kennel_type || null,
+      kennel_grad_status: row.kennel_grad_status || null,
+      kennel_status: row.kennel_type ? 'unassigned' : 'needs_size',
+      last_modified_source: 'portal',
+      last_synced_at: new Date().toISOString(),
+      ghl_date_added: row.start_date ? new Date(row.start_date).toISOString() : new Date().toISOString()
+    };
 
-    const time = parseRequestedTime(r[idxTime]);
-    if (!time) {
-      console.warn(`Skipping row with unparseable time: ${r[idxId]} "${r[idxTime]}"`);
-      continue;
-    }
+    const { error } = await supabase.from('boarding_stays').insert(payload);
 
-    relevant.push({
-      appointmentId: r[idxId],
-      time,
-      // dateAdded is the GHL booking timestamp — what the pairing engine uses
-      // to match drop-off + pick-up from the same booking session.
-      dateAdded: idxDateAdded !== -1 ? (r[idxDateAdded] || '').trim() || null : null,
-      contactName: (r[idxContact] || '').trim(),
-      email: (r[idxEmail] || '').trim(),
-      phone: (r[idxPhone] || '').trim(),
-      dogName: idxDogName !== -1 ? (r[idxDogName] || '').trim() || null : null,
-      calendarName,
-      serviceType: calMeta.serviceType,
-      role: calMeta.role,
-      pairingGroup: pairingGroupOf(calMeta.serviceType),
-      outcome,
-    });
-  }
-
-  console.log(`${relevant.length} relevant boarding-type appointments (after excluding cancelled/invalid/noshow and non-boarding calendars).`);
-  if (unknownCalendars.size > 0) {
-    console.warn(`\n⚠ ${unknownCalendars.size} calendar name(s) not in CALENDAR_MAP — rows skipped:`);
-    for (const name of [...unknownCalendars].sort()) console.warn(`    "${name}"`);
-    console.warn('  Add them to CALENDAR_MAP in rebuild-from-csv.js if they should be imported.');
-  }
-  console.log('');
-
-  // Step 2: group by contact identity. Email is the most stable key when
-  // present; fall back to phone, then name, since the CSV has no contact ID.
-  const contactKey = a => (a.email || a.phone || a.contactName || 'unknown').toLowerCase();
-
-  const byContact = new Map();
-  for (const a of relevant) {
-    const key = contactKey(a);
-    if (!byContact.has(key)) byContact.set(key, []);
-    byContact.get(key).push(a);
-  }
-
-  console.log(`${byContact.size} distinct contacts.\n`);
-
-  // Step 3: within each contact, group by pairing group, sort
-  // chronologically, and pair strictly by alternation: the Nth dropoff
-  // pairs with the Nth pickup in time order. This is what correctly
-  // threads frequent repeat customers instead of "closest in time".
-  const stays = [];
-
-  for (const [key, appts] of byContact) {
-    const byGroup = new Map();
-    for (const a of appts) {
-      if (!byGroup.has(a.pairingGroup)) byGroup.set(a.pairingGroup, []);
-      byGroup.get(a.pairingGroup).push(a);
-    }
-
-    for (const [group, groupAppts] of byGroup) {
-      const dropoffs = groupAppts.filter(a => a.role === 'dropoff').sort((a, b) => a.time - b.time);
-      const pickups  = groupAppts.filter(a => a.role === 'pickup').sort((a, b) => a.time - b.time);
-
-      // Two-pointer chronological merge: walk both lists in time order and
-      // pair a dropoff with the next pickup ONLY if that pickup is at or
-      // after the dropoff. If a pickup comes before the next available
-      // dropoff (e.g. its real dropoff was cancelled/excluded), it's
-      // emitted standalone as incomplete rather than force-paired backwards.
-      let di = 0, pi = 0;
-      while (di < dropoffs.length || pi < pickups.length) {
-        const d = di < dropoffs.length ? dropoffs[di] : null;
-        const p = pi < pickups.length  ? pickups[pi]  : null;
-
-        if (d && p) {
-          if (p.time >= d.time) {
-            stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, dogName: d.dogName || p.dogName || null, serviceType: d.serviceType, dropoff: d, pickup: p });
-            di++; pi++;
-          } else {
-            // Pickup predates this dropoff — it has no valid dropoff partner here.
-            stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, dogName: p.dogName || null, serviceType: p.serviceType, dropoff: null, pickup: p });
-            pi++;
-          }
-        } else if (d) {
-          stays.push({ contactName: d.contactName, email: d.email, phone: d.phone, dogName: d.dogName || null, serviceType: d.serviceType, dropoff: d, pickup: null });
-          di++;
-        } else if (p) {
-          stays.push({ contactName: p.contactName, email: p.email, phone: p.phone, dogName: p.dogName || null, serviceType: p.serviceType, dropoff: null, pickup: p });
-          pi++;
-        }
-      }
-    }
-  }
-
-  console.log(`Built ${stays.length} stay(s) from chronological pairing.\n`);
-
-  // Step 4: compute status per stay
-  const now = new Date();
-  const todayStr = getDateStringInTZ(now, CONFIG.TIMEZONE);
-
-  let incompleteCount = 0;
-  for (const stay of stays) {
-    let status = 'confirmed';
-    if (!stay.dropoff || !stay.pickup) { status = 'incomplete'; incompleteCount++; }
-
-    if (status === 'confirmed') {
-      const startStr = getDateStringInTZ(stay.dropoff.time, CONFIG.TIMEZONE);
-      const endStr    = getDateStringInTZ(stay.pickup.time,  CONFIG.TIMEZONE);
-      if (startStr <= todayStr && endStr >= todayStr) status = 'active';
-      else if (endStr < todayStr) status = 'completed';
-    }
-    stay.status = status;
-  }
-
-  console.log(`Status breakdown:`);
-  console.log(`  incomplete: ${incompleteCount}`);
-  console.log(`  other:      ${stays.length - incompleteCount}\n`);
-
-  if (DRY_RUN) {
-    console.log('--- Sample of first 15 stays ---');
-    stays.slice(0, 15).forEach(s => {
-      console.log(`  ${s.contactName} [${s.serviceType}] ${s.status} — dropoff:${s.dropoff?.time.toDateString() || 'MISSING'} pickup:${s.pickup?.time.toDateString() || 'MISSING'}`);
-    });
-    console.log(`\n[dry-run] Would delete existing synced rows and insert ${stays.length} stays. No changes made.`);
-    return;
-  }
-
-  // Step 5a: snapshot existing dog_name values keyed by appointment ID,
-  // so we can restore them after the wipe (the CSV doesn't include dog names).
-  console.log('Snapshotting existing dog_name values before wipe...');
-  const dogNameByDropoff = new Map();
-  const dogNameByPickup  = new Map();
-  const contactIdByDropoff = new Map();
-  const contactIdByPickup  = new Map();
-  let snapshotCursor = 0;
-  const SNAP_BATCH = 1000;
-  while (true) {
-    const { data: snap, error: snapErr } = await supabase
-      .from('boarding_stays')
-      .select('ghl_dropoff_appointment_id, ghl_pickup_appointment_id, dog_name, contact_id')
-      .range(snapshotCursor, snapshotCursor + SNAP_BATCH - 1);
-    if (snapErr || !snap || snap.length === 0) break;
-    for (const row of snap) {
-      if (row.dog_name) {
-        if (row.ghl_dropoff_appointment_id) dogNameByDropoff.set(row.ghl_dropoff_appointment_id, row.dog_name);
-        if (row.ghl_pickup_appointment_id)  dogNameByPickup.set(row.ghl_pickup_appointment_id,  row.dog_name);
-      }
-      if (row.contact_id) {
-        if (row.ghl_dropoff_appointment_id) contactIdByDropoff.set(row.ghl_dropoff_appointment_id, row.contact_id);
-        if (row.ghl_pickup_appointment_id)  contactIdByPickup.set(row.ghl_pickup_appointment_id,  row.contact_id);
-      }
-    }
-    snapshotCursor += snap.length;
-    if (snap.length < SNAP_BATCH) break;
-  }
-  console.log(`Snapshotted dog_name for ${dogNameByDropoff.size + dogNameByPickup.size} appointment references.\n`);
-
-  // Step 5b: wipe existing synced rows (preserve anything staff hand-edited
-  // via the portal), then insert fresh data.
-  console.log('Deleting all existing rows from boarding_stays...');
-  const { error: deleteError, count } = await supabase
-    .from('boarding_stays')
-    .delete({ count: 'exact' })
-    .gte('created_at', '2000-01-01'); // always-true filter — matches every row
-
-  if (deleteError) {
-    console.error('Failed to delete existing rows:', deleteError.message);
-    process.exit(1);
-  }
-  console.log(`Deleted ${count ?? 'an unknown number of'} rows.\n`);
-
-  console.log('Inserting rebuilt stays...');
-  let inserted = 0, errors = 0;
-  const BATCH_SIZE = 100;
-  for (let i = 0; i < stays.length; i += BATCH_SIZE) {
-    const batch = stays.slice(i, i + BATCH_SIZE).map(s => {
-      const dropoffId = s.dropoff?.appointmentId || null;
-      const pickupId  = s.pickup?.appointmentId  || null;
-      // Dog name priority: (1) directly from CSV column, (2) snapshot from prior DB rows
-      const dog_name =
-        s.dogName ||
-        (dropoffId && dogNameByDropoff.get(dropoffId)) ||
-        (pickupId  && dogNameByPickup.get(pickupId))   || null;
-
-      // Use the earliest GHL dateAdded between the two legs as the
-      // pairing anchor — matches how the live webhook flow stores it.
-      const rawDateAdded = s.dropoff?.dateAdded || s.pickup?.dateAdded || null;
-      const ghl_date_added = rawDateAdded ? new Date(rawDateAdded).toISOString() : null;
-      const contact_id =
-        (dropoffId && contactIdByDropoff.get(dropoffId)) ||
-        (pickupId  && contactIdByPickup.get(pickupId))   || null;
-      return {
-        ghl_dropoff_appointment_id: dropoffId,
-        ghl_pickup_appointment_id:  pickupId,
-        contact_id: contact_id || 'csv-import',
-        owner_name:  s.contactName || null,
-        owner_email: s.email || null,
-        owner_phone: s.phone || null,
-        dog_name,
-        ghl_date_added,
-        start_date: s.dropoff?.time.toISOString() || null,
-        end_date:   s.pickup?.time.toISOString()  || null,
-        source: 'internal',
-        service_type: s.serviceType,
-        status: s.status,
-        is_returning_client: false,
-        last_modified_source: 'ghl',
-        last_synced_at: new Date().toISOString(),
-      };
-    });
-
-    const { error } = await supabase.from('boarding_stays').insert(batch);
     if (error) {
-      console.error(`Batch ${i / BATCH_SIZE + 1} failed:`, error.message);
-      errors += batch.length;
+      console.error(`✗ Error inserting row for ${row.owner_name}:`, error.message);
+      errors++;
     } else {
-      inserted += batch.length;
+      console.log(`✓ Successfully loaded stay for ${row.owner_name}`);
+      inserted++;
     }
-    console.log(`  ... ${Math.min(i + BATCH_SIZE, stays.length)} / ${stays.length}`);
   }
 
   console.log(`\n========================================`);
-  console.log(`Rebuild complete.`);
-  console.log(`  Inserted: ${inserted}`);
-  console.log(`  Errors:   ${errors}`);
+  console.log(`CSV Import complete.`);
+  console.log(`  Successfully Created: ${inserted}`);
+  console.log(`  Failed Errors:        ${errors}`);
   console.log(`========================================`);
 }
 
-main().catch(err => {
-  console.error('Rebuild failed:', err);
-  process.exit(1);
-});
+// Clear out old data from Supabase before running
+async function clearAndRun() {
+  console.log('Clearing old system history entries...');
+  await supabase.from('sync_log').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await supabase.from('boarding_stays').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await runImport();
+}
+
+clearAndRun().catch(console.error);
