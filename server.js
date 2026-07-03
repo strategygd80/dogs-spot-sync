@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — Pure Live GHL Sync Backend (Fully Featured)
+// The Dogs Spot — Live GHL Sync Backend (Strict Contact Fields)
 // Node.js / Express — Deploy to Render or Railway
 // ============================================================
 
@@ -75,7 +75,7 @@ const CONFIG = {
   },
 
   BOARDING_PAIRING_WINDOW_HOURS: 24,
-  MAX_STAY_DAYS: 90, // Extended 90-day support for long-term programs & bundles
+  MAX_STAY_DAYS: 90, 
   HEAL_INTERVAL_MS: 60000, 
   KENNEL_SIZE_FIELD_IDS: ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'], 
 };
@@ -143,7 +143,7 @@ async function getContactAppointments(contactId) {
 const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 function resolveDogName(contact) {
   if (!contact) return null;
-  const flatDog = contact.dogs_name || contact.dog_name;
+  const flatDog = contact.dogs_name || contact.dog_name || contact["Dog's Name"];
   if (flatDog && String(flatDog).trim()) return String(flatDog).trim();
 
   const customFields = contact.customFields || contact.customField || [];
@@ -178,7 +178,7 @@ const KENNEL_CATEGORY_MAP = {
 
 function resolveKennelCategory(contact, flatPayload) {
   let raw = null;
-  if (flatPayload) raw = flatPayload.kennel_category || flatPayload.kennelCategory;
+  if (flatPayload) raw = flatPayload.kennel_category || flatPayload.kennelCategory || flatPayload['Kennel Category'];
   if (!raw && contact) {
     const customFields = contact.customFields || contact.customField || [];
     if (Array.isArray(customFields)) {
@@ -324,6 +324,63 @@ async function determineStatus(source, contactId) {
 }
 
 // ------------------------------------------------------------
+// DYNAMIC LIVE PROFILE SYNC (CONTACT UPDATES EXCLUSIVELY)
+// ------------------------------------------------------------
+async function processContactUpdate(payload) {
+  const contactId = payload.id || payload.contactId || payload.contact_id;
+  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return;
+
+  // Resolve target core profile fields from payload
+  const ownerName = resolveOwnerName(payload);
+  const ownerEmail = payload.email ? String(payload.email).trim().toLowerCase() : null;
+  const ownerPhone = normalizePhone(payload.phone);
+  const dogName = resolveDogName(payload);
+  const kennelCat = resolveKennelCategory(payload, payload);
+
+  // Focus changes only on incomplete, active, or future upcoming trips
+  const { data: affectedStays, error: fetchError } = await supabase
+    .from('boarding_stays')
+    .select('*')
+    .eq('contact_id', contactId)
+    .not('status', 'in', '("cancelled","completed")');
+
+  if (fetchError || !affectedStays || affectedStays.length === 0) return;
+
+  for (const stay of affectedStays) {
+    const updatePayload = { last_synced_at: new Date().toISOString(), last_modified_source: 'ghl' };
+    let sizeCategoryShifted = false;
+
+    // Strict value differentiation checking to prevent redundant updates
+    if (ownerName && stay.owner_name !== ownerName) updatePayload.owner_name = ownerName;
+    if (ownerEmail && stay.owner_email !== ownerEmail) updatePayload.owner_email = ownerEmail;
+    if (ownerPhone && normalizePhone(stay.owner_phone) !== ownerPhone) updatePayload.owner_phone = ownerPhone;
+    if (dogName && stay.dog_name !== dogName) updatePayload.dog_name = dogName;
+
+    if (kennelCat) {
+      if (stay.kennel_type !== kennelCat.kennel_type || stay.kennel_grad_status !== kennelCat.kennel_grad_status) {
+        updatePayload.kennel_type = kennelCat.kennel_type;
+        updatePayload.kennel_grad_status = kennelCat.kennel_grad_status;
+        
+        // Reset room status allocation variables to trigger space recalculations
+        updatePayload.kennel_id = null;
+        updatePayload.kennel_status = 'unassigned';
+        sizeCategoryShifted = true;
+      }
+    }
+
+    // Only commit if profile details actually shifted
+    if (Object.keys(updatePayload).length > 2) {
+      await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
+      
+      // Instantly run the reallocation routine if category modified or space was vacant
+      if (sizeCategoryShifted || !stay.kennel_id) {
+        await assignKennelAndSave(stay.id).catch(() => null);
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------
 // PIPELINE WEBHOOK ENGINE
 // ------------------------------------------------------------
 async function processAppointment(payload, eventType) {
@@ -402,7 +459,6 @@ async function processAppointment(payload, eventType) {
 // ------------------------------------------------------------
 async function autoHealTimelineQueue() {
   try {
-    // ENFORCED: Chained filters execute natively off of an explicit select parameters blueprint
     const { data: incompleteStays } = await supabase
       .from('boarding_stays')
       .select('*')
@@ -412,13 +468,15 @@ async function autoHealTimelineQueue() {
     if (!incompleteStays || incompleteStays.length === 0) return;
 
     for (const stay of incompleteStays) {
+      if (!stay) continue;
       const ghlAppts = await getContactAppointments(stay.contact_id);
-      if (ghlAppts.length === 0) continue;
+      if (!ghlAppts || ghlAppts.length === 0) continue;
 
       const missingRole = stay.ghl_dropoff_appointment_id ? 'pickup' : 'dropoff';
       const existingApptTime = new Date(stay.start_date || stay.end_date).getTime();
 
       const matchingLeg = ghlAppts.find(appt => {
+        if (!appt || !appt.calendarId || !appt.startTime) return false;
         const calMeta = CALENDAR_LOOKUP[appt.calendarId];
         if (!calMeta || calMeta.role !== missingRole) return false;
 
@@ -432,12 +490,12 @@ async function autoHealTimelineQueue() {
         return true;
       });
 
-      if (matchingLeg) {
+      if (matchingLeg && matchingLeg.id && matchingLeg.startTime) {
         console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
         
         const isDropoff = missingRole === 'dropoff';
         const status = await determineStatus(stay.source, stay.contact_id);
-        const cleanLegTime = matchingLeg.startTime ? new Date(matchingLeg.startTime).toISOString() : null;
+        const cleanLegTime = new Date(matchingLeg.startTime).toISOString();
 
         const updatePayload = {
           [isDropoff ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id']: matchingLeg.id,
@@ -461,7 +519,7 @@ async function autoHealTimelineQueue() {
 setInterval(autoHealTimelineQueue, CONFIG.HEAL_INTERVAL_MS);
 
 // ------------------------------------------------------------
-// API WEBHOOK DISPATCH ROUTER (STANDARD GHL EVENT KEYS ONLY)
+// API WEBHOOK DISPATCH ROUTER (INTEGRATED APPOINTMENT & PROFILE SYNCS)
 // ------------------------------------------------------------
 app.post('/webhook/ghl', async (req, res) => {
   res.status(200).json({ received: true });
@@ -470,19 +528,26 @@ app.post('/webhook/ghl', async (req, res) => {
   const type = body.type || body.eventType || body.event || body.eventName;
   if (!type && !body.id && !body.appointmentId) return; 
 
-  const payload = {
-    ...body,
-    id:         body.id || body.appointmentId || body.appointment_id,
-    contactId:  body.contactId || body.contact_id,
-    calendarId: body.calendarId || body.calendar_id,
-    startTime:  body.startTime || body.start_time,
-    endTime:    body.endTime || body.end_time,
-    status:     body.status || body.appointmentStatus,
-    dateAdded:  body.dateAdded || body.date_added || body.createdAt,
-    _flatContact: body,
-  };
-
   try {
+    // ROUTE A: Handle profile data modification webhooks natively
+    if (type === 'ContactUpdate' || type === 'contact_update' || type === 'contact_changed') {
+      await processContactUpdate(body);
+      return;
+    }
+
+    // ROUTE B: Handle check-in and check-out booking flows
+    const payload = {
+      ...body,
+      id:         body.id || body.appointmentId || body.appointment_id,
+      contactId:  body.contactId || body.contact_id,
+      calendarId: body.calendarId || body.calendar_id,
+      startTime:  body.startTime || body.start_time,
+      endTime:    body.endTime || body.end_time,
+      status:     body.status || body.appointmentStatus,
+      dateAdded:  body.dateAdded || body.date_added || body.createdAt,
+      _flatContact: body,
+    };
+
     if (type === 'AppointmentDelete' || payload.status === 'cancelled') {
       const targetId = payload.id;
       await supabase.from('boarding_stays').update({ status: 'cancelled', last_modified_source: 'ghl', last_synced_at: new Date().toISOString() })
@@ -491,7 +556,7 @@ app.post('/webhook/ghl', async (req, res) => {
       await processAppointment(payload, type);
     }
   } catch (err) {
-    await logSync({ ghlAppointmentId: payload.id, direction: 'ghl_to_db', action: 'webhook_error', payload: req.body, status: 'failed', errorMessage: err.message });
+    await logSync({ ghlAppointmentId: body.id || body.appointmentId, direction: 'ghl_to_db', action: 'webhook_error', payload: req.body, status: 'failed', errorMessage: err.message });
   }
 });
 
