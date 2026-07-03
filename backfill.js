@@ -26,12 +26,12 @@ const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_KEY: process.env.SUPABASE_KEY,
 
-  // Calendar IDs — Mirroring server.js perfectly (Fixed the typo in PICKUP_INPERSON)
+  // Calendar IDs — Mirroring server.js perfectly
   CALENDARS: {
     boarding: {
       DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
       DROPOFF_ONLINE:   'ZmmjQJszkRMUltfEbumB',    // Boarding Drop Off - Online
-      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX9SR',   // Boarding Pick Up (Fixed '5R' typo to 'SR')
+      PICKUP_INPERSON:  '1FnbK7pQp1ViZWIzX9SR',   // Boarding Pick Up
       PICKUP_ONLINE:    'bN6wWGJa0qKq0QGRg4CC',    // Boarding Pick Up - Online
     },
     basic: {
@@ -66,7 +66,7 @@ const CONFIG = {
     },
   },
 
-  LOOKBACK_DAYS:  90,   
+  LOOKBACK_DAYS:  365,  // Expanded to 1 full year to capture deeper historical pairings
   LOOKAHEAD_DAYS: 180,  
   TIMEZONE: 'America/New_York',
   KENNEL_SIZE_FIELD_IDS: ['REPLACE_WITH_KENNEL_SIZE_FIELD_ID'], // Must match server.js configuration
@@ -220,11 +220,11 @@ async function backfill() {
   console.log(`\nTotal appointments fetched: ${allAppointments.length}\n`);
   if (allAppointments.length === 0) return;
 
-  // Chronological queue preparation
-  allAppointments.sort((a, b) => new Date(a.dateAdded || a.createdAt || 0) - new Date(b.dateAdded || b.createdAt || 0));
+  // Chronological queue sorted strictly by execution window (startTime) for historical tracking
+  allAppointments.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
   const stays = [];
-  const BOARDING_PAIRING_WINDOW_MS = 24 * 3600 * 1000;
+  const MAX_STAY_SPAN_MS = 30 * 24 * 3600 * 1000; // 30 Day structural ceiling limit
 
   for (const appt of allAppointments) {
     const calMeta = CALENDAR_LOOKUP[appt.calendarId];
@@ -236,33 +236,27 @@ async function backfill() {
     const missingField = isDropoff ? 'pickup' : 'dropoff';
 
     const contactId = appt.contactId;
-    const apptBookedAtStr = appt.dateAdded || appt.createdAt || new Date().toISOString();
-    const apptBookedAtMs = new Date(apptBookedAtStr).getTime();
+    const apptTimeMs = new Date(appt.startTime).getTime();
 
     let bestMatch = null;
+    let minDelta = Infinity;
 
-    if (group === 'boarding') {
-      // Boarding Logic: Session booking proximity calculation matrix
-      let minDiff = Infinity;
-      for (const stay of stays) {
-        if (stay.contactId !== contactId || stay.group !== 'boarding' || stay[missingField]) continue;
-        
-        const targetLeg = stay.dropoff || stay.pickup;
-        const targetBookedAtStr = targetLeg.dateAdded || targetLeg.createdAt || new Date().toISOString();
-        const targetBookedAtMs = new Date(targetBookedAtStr).getTime();
-        const diff = Math.abs(targetBookedAtMs - apptBookedAtMs);
+    // Direct Time Alignment Matrix using execution schedules (startTime)
+    for (const stay of stays) {
+      if (stay.contactId !== contactId || stay.group !== group || stay[missingField]) continue;
 
-        if (diff <= BOARDING_PAIRING_WINDOW_MS && diff < minDiff) {
-          minDiff = diff;
+      const targetLeg = stay.dropoff || stay.pickup;
+      const targetTimeMs = new Date(targetLeg.startTime).getTime();
+      const delta = Math.abs(targetTimeMs - apptTimeMs);
+
+      // Check chronologically: dropoff must happen on/before pickup leg, bounded by the 30-day window
+      if (delta <= MAX_STAY_SPAN_MS && delta < minDelta) {
+        if (isDropoff && apptTimeMs <= targetTimeMs) {
           bestMatch = stay;
-        }
-      }
-    } else {
-      // Flexible Pools Cross-Matching: Standard chronological structural FIFO mechanics
-      for (const stay of stays) {
-        if (stay.contactId === contactId && stay.group === 'flexible' && !stay[missingField]) {
+          minDelta = delta;
+        } else if (!isDropoff && targetTimeMs <= apptTimeMs) {
           bestMatch = stay;
-          break; // Grab the oldest awaiting match structure
+          minDelta = delta;
         }
       }
     }
@@ -270,7 +264,7 @@ async function backfill() {
     if (bestMatch) {
       if (isDropoff) {
         bestMatch.dropoff = appt;
-        bestMatch.serviceType = serviceType; // Priority mapping rules travel with arrival types
+        bestMatch.serviceType = serviceType; // Set service type from dropoff selection
       } else {
         bestMatch.pickup = appt;
       }
@@ -285,7 +279,7 @@ async function backfill() {
     }
   }
 
-  console.log(`Grouped into ${stays.length} stay(s)\n`);
+  console.log(`Grouped into ${stays.length} clean stay structural groups\n`);
 
   let created = 0, updated = 0, incomplete = 0, errors = 0;
 
@@ -312,14 +306,10 @@ async function backfill() {
       else if (endStr < todayStr) status = 'completed';
     }
 
-    // Process custom category lookups matching server.js schemas
     const cat = resolveKennelCategory(contact);
-    const dropoffBookedAt = dropoff ? (dropoff.dateAdded || dropoff.createdAt) : null;
-    const pickupBookedAt = pickup ? (pickup.dateAdded || pickup.createdAt) : null;
-    // Earliest booking timestamp is preserved as anchoring mechanism
-    const structuralBookedAt = (dropoffBookedAt && pickupBookedAt) 
-      ? (new Date(dropoffBookedAt) < new Date(pickupBookedAt) ? dropoffBookedAt : pickupBookedAt)
-      : (dropoffBookedAt || pickupBookedAt || new Date().toISOString());
+    
+    // Defaulting to the execution timestamp anchor for backfilled sorting integrity
+    const structuralBookedAt = dropoff?.startTime || pickup?.startTime || new Date().toISOString();
 
     const payload = {
       ghl_dropoff_appointment_id: dropoff?.id || null,
