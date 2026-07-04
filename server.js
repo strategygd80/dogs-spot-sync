@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend (Airtight Contact Update)
+// The Dogs Spot — GHL Sync Backend (Airtight 422 Range Fix)
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -191,9 +191,15 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
+// FIXED: Generates an explicit date boundary search window to satisfy range requirements and stop 422 errors
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
-  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}`);
+  
+  const now = new Date();
+  const searchStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
+  const searchEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
+
+  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
   return res.data?.events || res.data?.appointments || [];
 }
 
@@ -235,7 +241,6 @@ const KENNEL_CATEGORY_MAP = {
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
-// FIXED: Fully guarded against unexpected missing structures or nested payload configurations
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = null;
