@@ -258,7 +258,7 @@ function resolveDogName(contact) {
 }
 
 // ------------------------------------------------------------
-// AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
+// GLOBAL CATEGORY MAP (FULLY RESTORED)
 // ------------------------------------------------------------
 const KENNEL_CATEGORY_MAP = {
   'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated' },
@@ -287,6 +287,9 @@ const KENNEL_CATEGORY_MAP = {
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
+// ------------------------------------------------------------
+// AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
+// ------------------------------------------------------------
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
@@ -295,8 +298,35 @@ function resolveKennelCategory(contact, flatPayload) {
     }
 
     if (!raw) return null;
-    const key = String(raw).replace(/\s+/g, ' ').trim().toLowerCase();
-    return KENNEL_CATEGORY_MAP[key] || null;
+
+    const normalized = String(raw).replace(/\s+/g, ' ').trim();
+    const parts = normalized.split(/\s*-\s*/);
+    const typePart = parts[0] ? parts[0].trim().toLowerCase() : '';
+    const gradPart = parts[1] ? parts[1].trim().toLowerCase() : null;
+
+    let kennel_type = 'regular';
+    if (typePart.includes('special')) {
+      kennel_type = 'special_needs';
+    } else if (typePart.includes('small')) {
+      kennel_type = 'small';
+    } else if (typePart.includes('overflow')) {
+      kennel_type = 'overflow';
+    } else if (typePart.includes('regular')) {
+      kennel_type = 'regular';
+    }
+
+    let kennel_grad_status = null;
+    if (gradPart) {
+      if (gradPart.includes('non') || gradPart.includes('un')) {
+        kennel_grad_status = 'non_graduate';
+      } else if (gradPart.includes('grad')) {
+        kennel_grad_status = 'graduated';
+      } else if (gradPart.includes('process')) {
+        kennel_grad_status = 'in_process';
+      }
+    }
+
+    return { kennel_type, kennel_grad_status };
   } catch (err) {
     console.error("Error within resolveKennelCategory parser:", err.message);
     return null;
@@ -438,7 +468,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (dogName)   fieldUpdate.dog_name    = dogName;
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.graduation_status = kennelCat.kennel_grad_status;
+    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // Aligned with column name
     fieldUpdate.kennel_id         = null;
     fieldUpdate.kennel_status     = 'unassigned';
   }
@@ -477,7 +507,7 @@ async function logSync({ stayId, ghlAppointmentId, direction, action, payload, s
 // ------------------------------------------------------------
 // KENNEL ASSIGNMENT ENGINE
 // ------------------------------------------------------------
-async function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
   if (!aStart || !bStart) return false;
   const tAStart = new Date(aStart).getTime();
   const tAEnd = aEnd ? new Date(aEnd).getTime() : new Date('9999-12-31').getTime();
@@ -809,7 +839,6 @@ async function autoHealTimelineQueue() {
         return true;
       });
 
-      // FIXED: Restored variable scope configurations completely
       if (matchingLeg && (matchingLeg.id || matchingLeg.appointmentId)) {
         console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
         
@@ -1231,12 +1260,6 @@ app.get('/api/sync/failed', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ------------------------------------------------------------
-// AUTH — email + PIN login, with lockout after repeated failures
-// ------------------------------------------------------------
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_MINUTES = 15;
 
 app.post('/api/auth/login', async (req, res) => {
   try {
