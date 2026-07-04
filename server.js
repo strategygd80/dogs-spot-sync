@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend
+// The Dogs Spot — GHL Sync Backend (Airtight Contact Update)
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -34,15 +34,15 @@ app.use((req, res, next) => {
 // CONFIG — set these in your .env file
 // ------------------------------------------------------------
 const CONFIG = {
-  GHL_TOKEN:      process.env.GHL_TOKEN,       // pit-ab470c39-...
-  GHL_LOCATION:   process.env.GHL_LOCATION,    // BQHJ19uohldYe3eqA0bl
-  SUPABASE_URL:   process.env.SUPABASE_URL,    // from Supabase project settings
-  SUPABASE_KEY:   process.env.SUPABASE_KEY,    // service_role key (not anon)
+  GHL_TOKEN:      process.env.GHL_TOKEN,       
+  GHL_LOCATION:   process.env.GHL_LOCATION,    
+  SUPABASE_URL:   process.env.SUPABASE_URL,    
+  SUPABASE_KEY:   process.env.SUPABASE_KEY,    
   PORT:           process.env.PORT || 3000,
-  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  // optional: set in GHL webhook config
+  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  
+  TIMEZONE:       'America/New_York',
 
   // Calendar IDs — confirmed against GHL Settings → Calendars
-  // Each service type has 4 calendars: in-person/online x drop-off/pick-up
   CALENDARS: {
     boarding: {
       DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
@@ -82,13 +82,8 @@ const CONFIG = {
     },
   },
 
-  // Window in hours within which two appointments are considered part of the same booking
   PAIRING_WINDOW_HOURS: 2,
-
-  // KENNEL INVENTORY Capacity markers
   KENNEL_COUNTS: { regular: 20, special_needs: 10, small: 10 },
-
-  // Patched to leverage your verified Custom Field mapping keys
   KENNEL_SIZE_FIELD_IDS: ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'],
 };
 
@@ -196,7 +191,6 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
-// FIXED: Patched query params format loop to natively call GHL V2 Location events path without hitting 400 errors
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
   const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}`);
@@ -214,7 +208,7 @@ function resolveDogName(contact) {
   const customFields = contact.customFields || contact.customField || [];
   if (Array.isArray(customFields)) {
     for (const fieldId of DOG_NAME_FIELD_IDS) {
-      const entry = customFields.find(f => f.id === fieldId);
+      const entry = customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
       const value = entry?.value || entry?.fieldValue || null;
       if (value && String(value).trim()) return String(value).trim();
     }
@@ -241,30 +235,46 @@ const KENNEL_CATEGORY_MAP = {
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
+// FIXED: Fully guarded against unexpected missing structures or nested payload configurations
 function resolveKennelCategory(contact, flatPayload) {
-  let raw = null;
+  try {
+    let raw = null;
 
-  if (flatPayload) {
-    raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
-  }
-
-  if (!raw && contact) {
-    const customFields = contact.customFields || contact.customField || [];
-    if (Array.isArray(customFields)) {
-      for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
-        const entry = customFields.find(f => f.id === fieldId);
-        const val = entry?.value || entry?.fieldValue || null;
-        if (val) { raw = val; break; }
+    if (flatPayload) {
+      raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
+      
+      if (!raw && flatPayload.customFields && Array.isArray(flatPayload.customFields)) {
+        for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
+          const entry = flatPayload.customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
+          if (entry && (entry.value || entry.fieldValue)) {
+            raw = entry.value || entry.fieldValue;
+            break;
+          }
+        }
       }
     }
-    if (!raw) {
-      raw = contact['Kennel Category'] || contact['kennel_category'];
-    }
-  }
 
-  if (!raw) return null;
-  const key = String(raw).trim().toLowerCase();
-  return KENNEL_CATEGORY_MAP[key] || null;
+    if (!raw && contact) {
+      const customFields = contact.customFields || contact.customField || [];
+      if (Array.isArray(customFields)) {
+        for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
+          const entry = customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
+          const val = entry?.value || entry?.fieldValue || null;
+          if (val) { raw = val; break; }
+        }
+      }
+      if (!raw) {
+        raw = contact['Kennel Category'] || contact['kennel_category'];
+      }
+    }
+
+    if (!raw) return null;
+    const key = String(raw).trim().toLowerCase();
+    return KENNEL_CATEGORY_MAP[key] || null;
+  } catch (err) {
+    console.error("Error encountered within resolveKennelCategory parser:", err.message);
+    return null;
+  }
 }
 
 function resolveKennelType(contact, flatPayload) {
@@ -372,7 +382,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT UPDATE (Strict Fields Only - Restored)
+// PROCESS CONTACT UPDATE (Profile Restored Matrix)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -436,7 +446,6 @@ async function getAllKennels() {
   return data || [];
 }
 
-// FIXED: Swapped loose string operations out to process numeric Unix timestamps, fixing the 'unassigned' dashboard room bug
 function rangesOverlap(aStart, aEnd, bStart, bEnd) {
   if (!aStart || !bStart) return false;
   const tAStart = new Date(aStart).getTime();
@@ -447,7 +456,7 @@ function rangesOverlap(aStart, aEnd, bStart, bEnd) {
 }
 
 async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId) {
-  if (!startDate || !endDate) return null; // Added safety wall to prevent infinite checking windows
+  if (!startDate || !endDate) return null; 
   const kennels = (await getAllKennels()).filter(k => k.type === kennelType);
   if (!kennels.length) return null;
 
@@ -578,7 +587,6 @@ async function processAppointment(payload, eventType) {
     phone: _flatContact.phone || null,
   } : null;
 
-  // FIXED: Standardizes date layout arrays to pure UTC formats before executing database syncing loops
   const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
   const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
   const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
@@ -723,11 +731,10 @@ async function processCancellation(payload) {
 // ------------------------------------------------------------
 // AUTOMATED TIMELINE HEALING ENGINE (THE AUTO-RETRY LOOP)
 // ------------------------------------------------------------
-const MAX_STAY_DAYS = 90; // Upgraded 90-day tracking scope framework support
+const MAX_STAY_DAYS = 90; 
 
 async function autoHealTimelineQueue() {
   try {
-    // FIXED: Embedded explicit .select('*') instruction query block to stop backend object errors
     const { data: incompleteStays } = await supabase
       .from('boarding_stays')
       .select('*')
@@ -744,7 +751,6 @@ async function autoHealTimelineQueue() {
       const missingRole = stay.ghl_dropoff_appointment_id ? 'pickup' : 'dropoff';
       const existingApptTime = new Date(stay.start_date || stay.end_date).getTime();
 
-      // FIXED: Integrated structural checks to intercept malformed GHL payloads safely
       const matchingLeg = ghlAppts.find(appt => {
         if (!appt || !appt.calendarId) return false;
         const apptStartTime = appt.startTime || appt.start_time;
