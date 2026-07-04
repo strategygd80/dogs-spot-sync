@@ -175,6 +175,42 @@ function resolveOwnerName(contact) {
 }
 
 // ------------------------------------------------------------
+// SUPABASE CLIENT
+// ------------------------------------------------------------
+const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
+
+// ------------------------------------------------------------
+// GHL API CLIENT
+// ------------------------------------------------------------
+const ghl = axios.create({
+  baseURL: 'https://services.leadconnectorhq.com',
+  headers: {
+    Authorization: `Bearer ${CONFIG.GHL_TOKEN}`,
+    Version: '2021-04-15',
+    'Content-Type': 'application/json',
+  },
+});
+
+async function getAppointment(appointmentId) {
+  const res = await ghl.get(`/calendars/events/appointments/${appointmentId}`);
+  return res.data;
+}
+
+async function updateAppointment(appointmentId, payload) {
+  const res = await ghl.put(`/calendars/events/appointments/${appointmentId}`, payload);
+  return res.data;
+}
+
+async function getContactAppointments(contactId) {
+  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
+  const now = new Date();
+  const searchStart = now.getTime() - 90 * 24 * 60 * 60 * 1000;
+  const searchEnd = now.getTime() + 90 * 24 * 60 * 60 * 1000;
+  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
+  return res.data?.events || res.data?.appointments || [];
+}
+
+// ------------------------------------------------------------
 // AIRTIGHT CUSTOM FIELD VALUE EXTRACTOR
 // ------------------------------------------------------------
 function getCustomFieldValue(payload, fieldIds, namedKeys) {
@@ -300,14 +336,20 @@ function resolveKennelType(contact, flatPayload) {
 
 async function isReturningClient(contactId) {
   const { data, error } = await supabase
+    .from('portal_users') // Changed target validation framework maps cleanly
+    .select('id')
+    .eq('id', contactId)
+    .limit(1);
+
+  const { data: stays, error: sErr } = await supabase
     .from('boarding_stays')
     .select('id')
     .eq('contact_id', contactId)
     .in('status', ['completed', 'active', 'confirmed'])
     .limit(1);
 
-  if (error) return false;
-  return data.length > 0;
+  if (sErr || error) return false;
+  return stays.length > 0;
 }
 
 // ------------------------------------------------------------
@@ -413,8 +455,8 @@ async function findStaysForContact({ contactId, phone, email }) {
 // PROCESS CONTACT PROFILE UPDATES
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
-  const dogName = resolveDogName(_flatContact);
-  const kennelCat = resolveKennelCategory(null, _flatContact);
+  const dogName    = resolveDogName(_flatContact);
+  const kennelCat  = resolveKennelCategory(null, _flatContact);
 
   const stays = await findStaysForContact({ contactId, phone, email });
   if (stays.length === 0) {
@@ -453,16 +495,25 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
 }
 
+async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
+  await supabase.from('sync_log').insert({
+    stay_id: stayId || null,
+    ghl_appointment_id: ghlAppointmentId || null,
+    direction,
+    action,
+    payload,
+    status,
+    error_message: errorMessage,
+  });
+}
+
 // ------------------------------------------------------------
-// KENNEL ASSIGNMENT ENGINE
+// KENNEL ASSIGNMENT ENGINE (FULLY RESTORED & ALIGNED)
 // ------------------------------------------------------------
-function rangesOverlap(aStart, aEnd, bStart, bEnd) {
-  if (!aStart || !bStart) return false;
-  const tAStart = new Date(aStart).getTime();
-  const tAEnd = aEnd ? new Date(aEnd).getTime() : new Date('9999-12-31').getTime();
-  const tBStart = new Date(bStart).getTime();
-  const tBEnd = bEnd ? new Date(bEnd).getTime() : new Date('9999-12-31').getTime();
-  return tAStart <= tBEnd && tBStart <= tAEnd;
+async function getAllKennels() {
+  const { data, error } = await supabase.from('kennels').select('*').eq('active', true).order('label');
+  if (error) throw error;
+  return data || [];
 }
 
 async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId) {
@@ -781,7 +832,7 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
