@@ -175,42 +175,6 @@ function resolveOwnerName(contact) {
 }
 
 // ------------------------------------------------------------
-// SUPABASE CLIENT
-// ------------------------------------------------------------
-const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
-
-// ------------------------------------------------------------
-// GHL API CLIENT
-// ------------------------------------------------------------
-const ghl = axios.create({
-  baseURL: 'https://services.leadconnectorhq.com',
-  headers: {
-    Authorization: `Bearer ${CONFIG.GHL_TOKEN}`,
-    Version: '2021-04-15',
-    'Content-Type': 'application/json',
-  },
-});
-
-async function getAppointment(appointmentId) {
-  const res = await ghl.get(`/calendars/events/appointments/${appointmentId}`);
-  return res.data;
-}
-
-async function updateAppointment(appointmentId, payload) {
-  const res = await ghl.put(`/calendars/events/appointments/${appointmentId}`, payload);
-  return res.data;
-}
-
-async function getContactAppointments(contactId) {
-  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
-  const now = new Date();
-  const searchStart = now.getTime() - 90 * 24 * 60 * 60 * 1000;
-  const searchEnd = now.getTime() + 90 * 24 * 60 * 60 * 1000;
-  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
-  return res.data?.events || res.data?.appointments || [];
-}
-
-// ------------------------------------------------------------
 // AIRTIGHT CUSTOM FIELD VALUE EXTRACTOR
 // ------------------------------------------------------------
 function getCustomFieldValue(payload, fieldIds, namedKeys) {
@@ -258,7 +222,7 @@ function resolveDogName(contact) {
 }
 
 // ------------------------------------------------------------
-// GLOBAL CATEGORY MAP (FULLY RESTORED)
+// AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
 // ------------------------------------------------------------
 const KENNEL_CATEGORY_MAP = {
   'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated' },
@@ -287,9 +251,6 @@ const KENNEL_CATEGORY_MAP = {
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
-// ------------------------------------------------------------
-// AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
-// ------------------------------------------------------------
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
@@ -452,8 +413,8 @@ async function findStaysForContact({ contactId, phone, email }) {
 // PROCESS CONTACT PROFILE UPDATES
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
-  const dogName    = resolveDogName(_flatContact);
-  const kennelCat  = resolveKennelCategory(null, _flatContact);
+  const dogName = resolveDogName(_flatContact);
+  const kennelCat = resolveKennelCategory(null, _flatContact);
 
   const stays = await findStaysForContact({ contactId, phone, email });
   if (stays.length === 0) {
@@ -468,7 +429,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (dogName)   fieldUpdate.dog_name    = dogName;
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // Aligned with column name
+    fieldUpdate.graduation_status = kennelCat.kennel_grad_status;
     fieldUpdate.kennel_id         = null;
     fieldUpdate.kennel_status     = 'unassigned';
   }
@@ -490,18 +451,6 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   }
 
   console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
-}
-
-async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
-  await supabase.from('sync_log').insert({
-    stay_id: stayId || null,
-    ghl_appointment_id: ghlAppointmentId || null,
-    direction,
-    action,
-    payload,
-    status,
-    error_message: errorMessage,
-  });
 }
 
 // ------------------------------------------------------------
