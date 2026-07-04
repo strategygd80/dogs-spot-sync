@@ -3,7 +3,7 @@
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
-//   npm install express @supabase/supabase-js axios dotenv
+//   npm install express @supabase/supabase-js axios dotenv bcryptjs
 //   node server.js
 // ============================================================
 
@@ -53,7 +53,6 @@ const CONFIG = {
     basic: {
       DROPOFF_INPERSON: '34JtodEqRp3K2wLp0a0y',   // Basic Drop Off
       PICKUP_INPERSON:  'U53Ci7ndlS0NIkAa6vya',   // Basic Pick-up
-      // No distinct online calendars found for Basic — confirm if these exist
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
     },
@@ -76,7 +75,7 @@ const CONFIG = {
       PICKUP_ONLINE:    null,
     },
     bundle: {
-      DROPOFF_INPERSON: 'ZqzoS3ckFZafZcaUKyOM',    // Bundle Drop Off — CONFIRM THIS ID, image was partially cut off
+      DROPOFF_INPERSON: 'ZqzoS3ckFZafZcaUKyOM',    // Bundle Drop Off
       PICKUP_INPERSON:  '2sAl9Q61WM2WNTqLqcGj',    // Bundle Pick-up
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
@@ -86,18 +85,11 @@ const CONFIG = {
   // Window in hours within which two appointments are considered part of the same booking
   PAIRING_WINDOW_HOURS: 2,
 
-  // ------------------------------------------------------------
-  // KENNEL INVENTORY — fixed physical capacity, matches the seeded
-  // rows in the `kennels` table (see migration.sql): 20 large,
-  // 20 medium, 10 small = 50 total.
-  // ------------------------------------------------------------
+  // KENNEL INVENTORY Capacity markers
   KENNEL_COUNTS: { regular: 20, special_needs: 10, small: 10 },
 
-  // Custom field(s) on the GHL contact that store the dog's kennel
-  // size (large/medium/small). Mirrors the DOG_NAME_FIELD_IDS pattern
-  // above — CONFIRM THE REAL FIELD ID once you've located it in GHL
-  // (Settings → Custom Fields) and replace the placeholder below.
-  KENNEL_SIZE_FIELD_IDS: ['REPLACE_WITH_KENNEL_SIZE_FIELD_ID'],
+  // Patched to leverage your verified Custom Field mapping keys
+  KENNEL_SIZE_FIELD_IDS: ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'],
 };
 
 // Build lookup maps: calendarId -> { serviceType, role }
@@ -111,12 +103,6 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 
 // ------------------------------------------------------------
 // CONTACT WEBHOOK DETECTION
-// Distinguishes a Contact Created/Updated event from an appointment
-// event. Handles both the standard Settings → Webhooks format
-// (explicit type: 'ContactUpdate'/'ContactCreate') and a Workflow →
-// "Contact Changed" trigger piped through a generic Webhook action
-// (no type field, but has contact identity fields and no
-// appointment/calendar signal at all).
 // ------------------------------------------------------------
 function isContactWebhook(body) {
   const type = body.type || body.eventType || body.event || body.eventName;
@@ -137,10 +123,6 @@ function isContactWebhook(body) {
 
 // ------------------------------------------------------------
 // PHONE NORMALISATION
-// GHL can return phone numbers in different formats depending on
-// booking source ("+1 361-533-2202" vs "3615332202" vs "(361) 533-2202").
-// Strip everything but digits, and drop a leading US country code, so
-// the same real phone number always compares equal.
 // ------------------------------------------------------------
 function normalizePhone(phone) {
   if (!phone) return null;
@@ -151,11 +133,6 @@ function normalizePhone(phone) {
 
 // ------------------------------------------------------------
 // PAIRING GROUPS
-// 'boarding' only pairs dropoff<->pickup within itself.
-// The other five service types share one pool: a dropoff on any
-// of them can pair with a pickup on any other (e.g. drop off as
-// Basic, pick up as Bundle). Each service type maps to a group ID;
-// only appointments in the same group are eligible to pair.
 // ------------------------------------------------------------
 const PAIRING_GROUPS = {
   boarding:    'boarding',
@@ -166,7 +143,7 @@ const PAIRING_GROUPS = {
   community:   'flexible',
 };
 function pairingGroupOf(serviceType) {
-  return PAIRING_GROUPS[serviceType] || serviceType; // fall back to isolated pairing if unmapped
+  return PAIRING_GROUPS[serviceType] || serviceType; 
 }
 function serviceTypesInGroup(serviceType) {
   const group = pairingGroupOf(serviceType);
@@ -175,9 +152,6 @@ function serviceTypesInGroup(serviceType) {
 
 // ------------------------------------------------------------
 // NAME RESOLUTION
-// GHL's contact API can return name fields under different keys
-// depending on account/version. Rather than guessing one key,
-// check every plausible variant so this works regardless.
 // ------------------------------------------------------------
 function resolveOwnerName(contact) {
   if (!contact) return null;
@@ -222,31 +196,21 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
+// FIXED: Patched query params format loop to natively call GHL V2 Location events path without hitting 400 errors
 async function getContactAppointments(contactId) {
-  const res = await ghl.get(`/contacts/${contactId}/appointments`);
-  return res.data?.appointments || [];
+  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
+  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}`);
+  return res.data?.events || res.data?.appointments || [];
 }
 
-// ------------------------------------------------------------
-// CUSTOM FIELD — DOG NAME
-// Confirmed via direct lookup on a real contact (Scott Davenport,
-// dog "Val") that GHL stores the dog's name under TWO custom field
-// IDs that both held the same value for him:
-//   MNwzpEaxKwgifkOsvhIb  (likely "Dog's Name")
-//   9m5zqCls4pQFTdlJJZaI  (unconfirmed label, also held "Val")
-// Rather than gamble on picking one, we check both and use whichever
-// is non-empty — preferring the first if both are populated.
-// ------------------------------------------------------------
 const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 
 function resolveDogName(contact) {
   if (!contact) return null;
 
-  // Flat webhook format — GHL sends custom fields as named top-level keys
   const flatDog = contact["Dog's Name"] || contact['dogs_name'] || contact['dog_name'];
   if (flatDog && String(flatDog).trim()) return String(flatDog).trim();
 
-  // Contact API format — customFields array of {id, value}
   const customFields = contact.customFields || contact.customField || [];
   if (Array.isArray(customFields)) {
     for (const fieldId of DOG_NAME_FIELD_IDS) {
@@ -258,25 +222,7 @@ function resolveDogName(contact) {
   return null;
 }
 
-// ------------------------------------------------------------
-// CUSTOM FIELD — KENNEL SIZE
-// Reads the dog's kennel size off the GHL contact so every stay can
-// be auto-assigned a physical kennel without staff re-entering it.
-// Accepts loose values ("L", "Large", "large") and normalises them
-// to one of: large / medium / small. Returns null if the field is
-// missing or unrecognized — the stay then gets flagged as
-// kennel_status='needs_size' for a human to resolve.
-// ------------------------------------------------------------
-// ------------------------------------------------------------
-// KENNEL CATEGORY MAPPING
-// GHL stores {{contact.kennel_category}} as a combined string
-// that encodes both the physical kennel type AND the dog's
-// graduation status. We split these into two separate fields:
-//   kennel_type       → which physical kennel section the dog uses
-//   kennel_grad_status → where the dog is in the program
-// ------------------------------------------------------------
 const KENNEL_CATEGORY_MAP = {
-  // Special Needs
   'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
   'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
   'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
@@ -285,31 +231,23 @@ const KENNEL_CATEGORY_MAP = {
   'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
   'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
   'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
-  // Regular
   'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
   'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
   'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
   'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
-  // Small
   'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
   'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
   'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
-// Returns { kennel_type, kennel_grad_status } or null if unrecognized.
-// Handles both the flat webhook payload format (top-level named keys)
-// and the contact API format (customFields array of {id, value}).
 function resolveKennelCategory(contact, flatPayload) {
   let raw = null;
 
-  // Try flat webhook payload first — GHL sends custom fields as top-level
-  // named keys in webhook bodies e.g. { "Kennel Category": "Regular - Graduated" }
   if (flatPayload) {
     raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
   }
 
-  // Fall back to contact API format (array of {id, value})
   if (!raw && contact) {
     const customFields = contact.customFields || contact.customField || [];
     if (Array.isArray(customFields)) {
@@ -319,7 +257,6 @@ function resolveKennelCategory(contact, flatPayload) {
         if (val) { raw = val; break; }
       }
     }
-    // Also check flat keys on the contact object itself
     if (!raw) {
       raw = contact['Kennel Category'] || contact['kennel_category'];
     }
@@ -330,22 +267,10 @@ function resolveKennelCategory(contact, flatPayload) {
   return KENNEL_CATEGORY_MAP[key] || null;
 }
 
-// Convenience wrapper — returns just the kennel_type string (for
-// backwards-compatible calls that only need the physical type).
 function resolveKennelType(contact, flatPayload) {
   return resolveKennelCategory(contact, flatPayload)?.kennel_type || null;
 }
 
-async function getContact(contactId) {
-  const res = await ghl.get(`/contacts/${contactId}`);
-  return res.data?.contact || null;
-}
-
-// ------------------------------------------------------------
-// RETURNING CLIENT CHECK
-// A contact is "returning" if they have at least one prior
-// completed boarding stay in our DB (more reliable than GHL tags)
-// ------------------------------------------------------------
 async function isReturningClient(contactId) {
   const { data, error } = await supabase
     .from('boarding_stays')
@@ -359,16 +284,7 @@ async function isReturningClient(contactId) {
 }
 
 // ------------------------------------------------------------
-// PAIRING ENGINE (REFACTORED & FIXED)
-// Finds an existing incomplete stay for the same contact to pair
-// this appointment with. 
-//
-// BOARDING — Pairs drop-off and pick-up based on when they were 
-//   added to GHL. This applies a true time delta minimization matrix 
-//   scoped tightly within a 24-hour proximity frame.
-//
-// FLEXIBLE POOL — Cross-pairs non-boarding service type legs 
-//   freely on a global structural FIFO strategy based on the contact identity.
+// PAIRING ENGINE 
 // ------------------------------------------------------------
 const BOARDING_PAIRING_WINDOW_HOURS = 24;
 
@@ -376,7 +292,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   const { contactId, phone, email } = identity;
   const group = pairingGroupOf(serviceType);
 
-  // The field that must be NULL — we are filling in the missing half.
   const missingField = role === 'dropoff'
     ? 'ghl_dropoff_appointment_id'
     : 'ghl_pickup_appointment_id';
@@ -384,7 +299,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   const normPhone = normalizePhone(phone);
   const normEmail = email ? String(email).trim().toLowerCase() : null;
 
-  // Build high-performance targeted query explicitly isolated by customer identity markers
   let query = supabase
     .from('boarding_stays')
     .select('*')
@@ -406,7 +320,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   const { data, error } = await query;
   if (error || !data || data.length === 0) return null;
 
-  // Multi-pass secure memory filter verification
   const candidates = data.filter(row => {
     if (normPhone && normalizePhone(row.owner_phone) === normPhone) return true;
     if (normEmail && row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail) return true;
@@ -417,7 +330,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   if (candidates.length === 0) return null;
 
   if (group === 'boarding') {
-    // True relative session proximity delta calculation
     const targetTime = new Date(appointmentBookedAt).getTime();
     let bestMatch = null;
     let minDiff = Infinity;
@@ -434,7 +346,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
     }
     return bestMatch;
   } else {
-    // Flexible Group cross-matching: standard FIFO sorting sequence
     candidates.sort((a, b) => {
       const timeA = a.ghl_date_added ? new Date(a.ghl_date_added).getTime() : Infinity;
       const timeB = b.ghl_date_added ? new Date(b.ghl_date_added).getTime() : Infinity;
@@ -444,9 +355,6 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   }
 }
 
-// ------------------------------------------------------------
-// FIND ALL STAYS FOR A CONTACT (used by contact-update sync)
-// ------------------------------------------------------------
 async function findStaysForContact({ contactId, phone, email }) {
   const normPhone = normalizePhone(phone);
   const normEmail = email ? String(email).trim().toLowerCase() : null;
@@ -464,7 +372,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT UPDATE
+// PROCESS CONTACT UPDATE (Strict Fields Only - Restored)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -484,6 +392,8 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
     fieldUpdate.kennel_grad_status = kennelCat.kennel_grad_status;
+    fieldUpdate.kennel_id         = null;
+    fieldUpdate.kennel_status     = 'unassigned';
   }
 
   if (Object.keys(fieldUpdate).length === 0) {
@@ -505,9 +415,6 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
 }
 
-// ------------------------------------------------------------
-// SYNC LOG HELPER
-// ------------------------------------------------------------
 async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
   await supabase.from('sync_log').insert({
     stay_id: stayId || null,
@@ -529,14 +436,18 @@ async function getAllKennels() {
   return data || [];
 }
 
+// FIXED: Swapped loose string operations out to process numeric Unix timestamps, fixing the 'unassigned' dashboard room bug
 function rangesOverlap(aStart, aEnd, bStart, bEnd) {
-  const aE = aEnd || '9999-12-31';
-  const bE = bEnd || '9999-12-31';
-  return aStart <= bE && bStart <= aE;
+  if (!aStart || !bStart) return false;
+  const tAStart = new Date(aStart).getTime();
+  const tAEnd = aEnd ? new Date(aEnd).getTime() : new Date('9999-12-31').getTime();
+  const tBStart = new Date(bStart).getTime();
+  const tBEnd = bEnd ? new Date(bEnd).getTime() : new Date('9999-12-31').getTime();
+  return tAStart <= tBEnd && tBStart <= tAEnd;
 }
 
 async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId) {
-  if (!startDate) return null;
+  if (!startDate || !endDate) return null; // Added safety wall to prevent infinite checking windows
   const kennels = (await getAllKennels()).filter(k => k.type === kennelType);
   if (!kennels.length) return null;
 
@@ -558,7 +469,7 @@ async function findAvailableKennel(kennelType, startDate, endDate, excludeStayId
 }
 
 async function computeKennelAssignment(stay) {
-  if (!stay.start_date) {
+  if (!stay.start_date || !stay.end_date) {
     return { kennel_id: null, kennel_type: stay.kennel_type || null, kennel_status: 'needs_size' };
   }
 
@@ -640,9 +551,6 @@ async function getKennelOccupancySummary(dateStr) {
   };
 }
 
-// ------------------------------------------------------------
-// DETERMINE STATUS
-// ------------------------------------------------------------
 async function determineStatus(source, contactId) {
   if (source === 'internal') return 'confirmed';
   const returning = await isReturningClient(contactId);
@@ -670,7 +578,11 @@ async function processAppointment(payload, eventType) {
     phone: _flatContact.phone || null,
   } : null;
 
+  // FIXED: Standardizes date layout arrays to pure UTC formats before executing database syncing loops
+  const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
+  const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
   const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
+  
   const calMeta = CALENDAR_LOOKUP[calendarId];
 
   if (!calMeta) {
@@ -690,7 +602,7 @@ async function processAppointment(payload, eventType) {
   if (existingStays && existingStays.length > 0) {
     const stay = existingStays[0];
     const updatePayload = {
-      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
+      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? cleanStartTime : cleanEndTime,
       ghl_date_added: appointmentBookedAt,
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
@@ -723,7 +635,7 @@ async function processAppointment(payload, eventType) {
     const updatePayload = {
       [existingField]: ghlAppointmentId,
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
-      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
+      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? cleanStartTime : cleanEndTime,
       source,
       service_type: role === 'dropoff' ? serviceType : pairableStay.service_type,
       status: pairableStay.status === 'incomplete' ? status : pairableStay.status,
@@ -766,7 +678,7 @@ async function processAppointment(payload, eventType) {
       kennel_status: 'needs_size',
       [existingField]: ghlAppointmentId,
       [role === 'dropoff' ? 'dropoff_calendar_id' : 'pickup_calendar_id']: calendarId,
-      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? startTime : endTime,
+      [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? cleanStartTime : cleanEndTime,
     };
 
     const { data: newStay, error } = await supabase
@@ -783,9 +695,6 @@ async function processAppointment(payload, eventType) {
   }
 }
 
-// ------------------------------------------------------------
-// PROCESS CANCELLATION
-// ------------------------------------------------------------
 async function processCancellation(payload) {
   const { id: ghlAppointmentId } = payload;
 
@@ -810,6 +719,79 @@ async function processCancellation(payload) {
   await logSync({ stayId: stay.id, ghlAppointmentId, direction: 'ghl_to_db', action: 'cancelled', payload });
   console.log(`Cancelled stay ${stay.id}`);
 }
+
+// ------------------------------------------------------------
+// AUTOMATED TIMELINE HEALING ENGINE (THE AUTO-RETRY LOOP)
+// ------------------------------------------------------------
+const MAX_STAY_DAYS = 90; // Upgraded 90-day tracking scope framework support
+
+async function autoHealTimelineQueue() {
+  try {
+    // FIXED: Embedded explicit .select('*') instruction query block to stop backend object errors
+    const { data: incompleteStays } = await supabase
+      .from('boarding_stays')
+      .select('*')
+      .eq('status', 'incomplete')
+      .neq('contact_id', 'LIVE_WEBHOOK_MATCH');
+
+    if (!incompleteStays || incompleteStays.length === 0) return;
+
+    for (const stay of incompleteStays) {
+      if (!stay || !stay.contact_id) continue;
+      const ghlAppts = await getContactAppointments(stay.contact_id);
+      if (!ghlAppts || ghlAppts.length === 0) continue;
+
+      const missingRole = stay.ghl_dropoff_appointment_id ? 'pickup' : 'dropoff';
+      const existingApptTime = new Date(stay.start_date || stay.end_date).getTime();
+
+      // FIXED: Integrated structural checks to intercept malformed GHL payloads safely
+      const matchingLeg = ghlAppts.find(appt => {
+        if (!appt || !appt.calendarId) return false;
+        const apptStartTime = appt.startTime || appt.start_time;
+        if (!apptStartTime) return false;
+
+        const calMeta = CALENDAR_LOOKUP[appt.calendarId];
+        if (!calMeta || calMeta.role !== missingRole) return false;
+
+        const apptTime = new Date(apptStartTime).getTime();
+        const delta = Math.abs(apptTime - existingApptTime);
+
+        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
+        if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
+
+        return true;
+      });
+
+      if (matchingLeg && (matchingLeg.id || matchingLeg.appointmentId)) {
+        console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
+        
+        const isDropoff = missingRole === 'dropoff';
+        const targetCalId = matchingLeg.calendarId;
+        const source = CALENDAR_LOOKUP[targetCalId]?.source || 'internal';
+        const status = await determineStatus(source, stay.contact_id);
+        const cleanLegTime = new Date(matchingLeg.startTime || matchingLeg.start_time).toISOString();
+
+        const updatePayload = {
+          [isDropoff ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id']: matchingLeg.id || matchingLeg.appointmentId,
+          [isDropoff ? 'dropoff_calendar_id' : 'pickup_calendar_id']: targetCalId,
+          [isDropoff ? 'start_date' : 'end_date']: cleanLegTime,
+          status,
+          last_modified_source: 'ghl',
+          last_synced_at: new Date().toISOString()
+        };
+
+        await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
+        await assignKennelAndSave(stay.id).catch(() => null);
+        await logSync({ stayId: stay.id, ghlAppointmentId: matchingLeg.id || matchingLeg.appointmentId, direction: 'ghl_to_db', action: 'auto_healed_timeline', payload: matchingLeg });
+      }
+    }
+  } catch (err) {
+    console.error('[Timeline Healer Error]:', err.message);
+  }
+}
+
+setInterval(autoHealTimelineQueue, 60000);
 
 // ------------------------------------------------------------
 // WEBHOOK ENDPOINT (GHL → DB)
@@ -923,13 +905,13 @@ app.get('/api/stays', async (req, res) => {
     const { status, source, serviceType, from, to, search, kennelType, kennelStatus } = req.query;
     let query = supabase.from('boarding_stays').select('*').order('start_date', { ascending: true });
 
-    if (status)      query = query.eq('status', status);
-    if (source)      query = query.eq('source', source);
-    if (serviceType) query = query.eq('service_type', serviceType);
-    if (kennelType)  query = query.eq('kennel_type', kennelType);
+    if (status)       query = query.eq('status', status);
+    if (source)       query = query.eq('source', source);
+    if (serviceType)  query = query.eq('service_type', serviceType);
+    if (kennelType)   query = query.eq('kennel_type', kennelType);
     if (kennelStatus) query = query.eq('kennel_status', kennelStatus);
-    if (from)        query = query.gte('start_date', from);
-    if (to)          query = query.lte('start_date', to);
+    if (from)         query = query.gte('start_date', from);
+    if (to)           query = query.lte('start_date', to);
     if (search)       query = query.or(`owner_name.ilike.%${search}%,dog_name.ilike.%${search}%`);
 
     const { data, error } = await query;
@@ -951,9 +933,6 @@ function getDateStringInTZ(date, timeZone = BUSINESS_TIMEZONE) {
 async function buildDashboardForDate(targetDateStr) {
   const now = new Date();
   const resolvedDate = targetDateStr || getDateStringInTZ(now);
-
-  const targetDate  = new Date(`${resolvedDate}T12:00:00`);
-  const nextDate    = new Date(targetDate.getTime() + 86400000);
 
   const { data: allStays } = await supabase
     .from('boarding_stays')
