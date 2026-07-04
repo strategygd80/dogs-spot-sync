@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend (Staggered Concurrency Fix)
+// The Dogs Spot — GHL Sync Backend
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -104,18 +104,20 @@ for (const [serviceType, cals] of Object.entries(CONFIG.CALENDARS)) {
 // ------------------------------------------------------------
 // CONTACT WEBHOOK DETECTION
 // ------------------------------------------------------------
-function isContactWebhook(body) {
+function isContactWebhook(body, query = {}) {
   const type = body.type || body.eventType || body.event || body.eventName;
   if (type && /contact/i.test(type)) return true;
 
   const hasAppointmentSignal =
     (body.calendar && body.calendar.appointmentId) ||
     body.appointmentId || body.appointment_id ||
-    body.calendarId || body.calendar_id;
+    body.calendarId || body.calendar_id ||
+    query.appointment_id || query.appointmentId ||
+    query.calendar_id || query.calendarId;
   if (hasAppointmentSignal) return false;
 
   const hasContactIdentity =
-    body.contact_id || body.contactId ||
+    body.contact_id || body.contactId || body.contact?.id || query.contact_id || query.contactId ||
     body.email || body.phone ||
     body.first_name || body.firstName;
   return Boolean(hasContactIdentity);
@@ -156,13 +158,16 @@ function serviceTypesInGroup(serviceType) {
 function resolveOwnerName(contact) {
   if (!contact) return null;
 
-  const fullNameCandidates = [contact.name, contact.fullName, contact.full_name, contact.contactName];
+  const fullNameCandidates = [
+    contact.name, contact.fullName, contact.full_name, contact.contactName,
+    contact.contact?.name, contact.contact?.fullName, contact.contact?.full_name
+  ];
   for (const candidate of fullNameCandidates) {
     if (candidate && String(candidate).trim()) return String(candidate).trim();
   }
 
-  const first = contact.firstName || contact.first_name || contact.firstname || '';
-  const last  = contact.lastName  || contact.last_name  || contact.lastname  || '';
+  const first = contact.firstName || contact.first_name || contact.firstname || contact.contact?.firstName || contact.contact?.first_name || '';
+  const last  = contact.lastName  || contact.last_name  || contact.lastname  || contact.contact?.lastName  || contact.contact?.last_name || '';
   const combined = [first, last].filter(Boolean).join(' ').trim();
   if (combined) return combined;
 
@@ -199,8 +204,8 @@ async function updateAppointment(appointmentId, payload) {
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
   const now = new Date();
-  const searchStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
-  const searchEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
+  const searchStart = now.getTime() - 90 * 24 * 60 * 60 * 1000;
+  const searchEnd = now.getTime() + 90 * 24 * 60 * 60 * 1000;
   const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
   return res.data?.events || res.data?.appointments || [];
 }
@@ -213,22 +218,22 @@ function getCustomFieldValue(payload, fieldIds, namedKeys) {
 
   if (namedKeys) {
     for (const key of namedKeys) {
-      if (payload[key] && String(payload[key]).trim()) {
-        return String(payload[key]).trim();
-      }
+      if (payload[key] && String(payload[key]).trim()) return String(payload[key]).trim();
+      if (payload.contact?.[key] && String(payload.contact[key]).trim()) return String(payload.contact[key]).trim();
     }
   }
 
   if (fieldIds) {
     for (const id of fieldIds) {
-      if (payload[id] && String(payload[id]).trim()) {
-        return String(payload[id]).trim();
-      }
+      if (payload[id] && String(payload[id]).trim()) return String(payload[id]).trim();
+      if (payload.contact?.[id] && String(payload.contact[id]).trim()) return String(payload.contact[id]).trim();
     }
   }
 
-  const cFields = payload.customFields || payload.customField || payload.custom_fields;
-  if (cFields) {
+  const checkFields = (target) => {
+    if (!target) return null;
+    const cFields = target.customFields || target.customField || target.custom_fields;
+    if (!cFields) return null;
     if (Array.isArray(cFields)) {
       for (const id of fieldIds) {
         const entry = cFields.find(f => f && (f.id === id || f.fieldId === id));
@@ -237,13 +242,13 @@ function getCustomFieldValue(payload, fieldIds, namedKeys) {
       }
     } else if (typeof cFields === 'object') {
       for (const id of fieldIds) {
-        if (cFields[id] && String(cFields[id]).trim()) {
-          return String(cFields[id]).trim();
-        }
+        if (cFields[id] && String(cFields[id]).trim()) return String(cFields[id]).trim();
       }
     }
-  }
-  return null;
+    return null;
+  };
+
+  return checkFields(payload) || checkFields(payload.contact);
 }
 
 const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
@@ -255,6 +260,33 @@ function resolveDogName(contact) {
 // ------------------------------------------------------------
 // AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
 // ------------------------------------------------------------
+const KENNEL_CATEGORY_MAP = {
+  'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated' },
+  'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated' },
+  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - non-graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - non-graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need - in-process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - in-process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
+  'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
+  'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
+  'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - non-graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular - in-process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
+  'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
+  'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - non-graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small - in-process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
+};
+
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
@@ -263,35 +295,8 @@ function resolveKennelCategory(contact, flatPayload) {
     }
 
     if (!raw) return null;
-
-    const normalized = String(raw).replace(/\s+/g, ' ').trim();
-    const parts = normalized.split(/\s*-\s*/);
-    const typePart = parts[0] ? parts[0].trim().toLowerCase() : '';
-    const gradPart = parts[1] ? parts[1].trim().toLowerCase() : null;
-
-    let kennel_type = 'regular';
-    if (typePart.includes('special')) {
-      kennel_type = 'special_needs';
-    } else if (typePart.includes('small')) {
-      kennel_type = 'small';
-    } else if (typePart.includes('overflow')) {
-      kennel_type = 'overflow';
-    } else if (typePart.includes('regular')) {
-      kennel_type = 'regular';
-    }
-
-    let kennel_grad_status = null;
-    if (gradPart) {
-      if (gradPart.includes('non') || gradPart.includes('un')) {
-        kennel_grad_status = 'non_graduate';
-      } else if (gradPart.includes('grad')) {
-        kennel_grad_status = 'graduated';
-      } else if (gradPart.includes('process')) {
-        kennel_grad_status = 'in_process';
-      }
-    }
-
-    return { kennel_type, kennel_grad_status };
+    const key = String(raw).replace(/\s+/g, ' ').trim().toLowerCase();
+    return KENNEL_CATEGORY_MAP[key] || null;
   } catch (err) {
     console.error("Error within resolveKennelCategory parser:", err.message);
     return null;
@@ -315,6 +320,21 @@ async function isReturningClient(contactId) {
 }
 
 // ------------------------------------------------------------
+// DETERMINE STATUS
+// FIXED: Anchored root level definition sequence
+// ------------------------------------------------------------
+async function determineStatus(source, contactId) {
+  if (source === 'internal') return 'confirmed';
+  const returning = await isReturningClient(contactId);
+  return returning ? 'confirmed' : 'requested';
+}
+
+async function getContact(contactId) {
+  const res = await ghl.get(`/contacts/${contactId}`);
+  return res.data?.contact || null;
+}
+
+// ------------------------------------------------------------
 // PAIRING ENGINE 
 // ------------------------------------------------------------
 const BOARDING_PAIRING_WINDOW_HOURS = 24;
@@ -323,10 +343,7 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   const { contactId, phone, email } = identity;
   const group = pairingGroupOf(serviceType);
 
-  const missingField = role === 'dropoff'
-    ? 'ghl_dropoff_appointment_id'
-    : 'ghl_pickup_appointment_id';
-
+  const missingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
   const normPhone = normalizePhone(phone);
   const normEmail = email ? String(email).trim().toLowerCase() : null;
 
@@ -338,7 +355,7 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
     .is(missingField, null);
 
   let orConditions = [];
-  if (contactId) orConditions.push(`contact_id.eq.${contactId}`);
+  if (contactId && contactId !== 'LIVE_WEBHOOK_MATCH') orConditions.push(`contact_id.eq.${contactId}`);
   if (normEmail) orConditions.push(`owner_email.ilike.${normEmail}`);
   if (normPhone) orConditions.push(`owner_phone.ilike.%${normPhone}%`);
 
@@ -352,9 +369,9 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   if (error || !data || data.length === 0) return null;
 
   const candidates = data.filter(row => {
+    if (contactId && row.contact_id === contactId) return true;
     if (normPhone && normalizePhone(row.owner_phone) === normPhone) return true;
     if (normEmail && row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail) return true;
-    if (contactId && row.contact_id === contactId) return true;
     return false;
   });
 
@@ -395,15 +412,15 @@ async function findStaysForContact({ contactId, phone, email }) {
   if (error || !data) return [];
 
   return data.filter(row => {
+    if (contactId && row.contact_id === contactId) return true;
     if (normPhone && normalizePhone(row.owner_phone) === normPhone) return true;
     if (normEmail && row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail) return true;
-    if (contactId && row.contact_id === contactId) return true;
     return false;
   });
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT PROFILE UPDATES (graduation_status Mapped)
+// PROCESS CONTACT PROFILE UPDATES
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -422,7 +439,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (dogName)   fieldUpdate.dog_name    = dogName;
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // Aligned with Supabase column name
+    fieldUpdate.graduation_status = kennelCat.kennel_grad_status;
     fieldUpdate.kennel_id         = null;
     fieldUpdate.kennel_status     = 'unassigned';
   }
@@ -446,28 +463,10 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
 }
 
-async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
-  await supabase.from('sync_log').insert({
-    stay_id: stayId || null,
-    ghl_appointment_id: ghlAppointmentId || null,
-    direction,
-    action,
-    payload,
-    status,
-    error_message: errorMessage,
-  });
-}
-
 // ------------------------------------------------------------
 // KENNEL ASSIGNMENT ENGINE
 // ------------------------------------------------------------
-async function getAllKennels() {
-  const { data, error } = await supabase.from('kennels').select('*').eq('active', true).order('label');
-  if (error) throw error;
-  return data || [];
-}
-
-function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+async function rangesOverlap(aStart, aEnd, bStart, bEnd) {
   if (!aStart || !bStart) return false;
   const tAStart = new Date(aStart).getTime();
   const tAEnd = aEnd ? new Date(aEnd).getTime() : new Date('9999-12-31').getTime();
@@ -596,14 +595,7 @@ async function processAppointment(payload, eventType) {
     _flatContact,
   } = payload;
 
-  const prefilled = _flatContact ? {
-    name:  _flatContact.full_name || [_flatContact.first_name, _flatContact.last_name].filter(Boolean).join(' ') || null,
-    email: _flatContact.email || null,
-    phone: _flatContact.phone || null,
-  } : null;
-
   const calMeta = CALENDAR_LOOKUP[calendarId];
-
   if (!calMeta) {
     console.log(`Ignoring appointment from unrecognized calendar: ${calendarId}`);
     return;
@@ -611,11 +603,17 @@ async function processAppointment(payload, eventType) {
 
   const { serviceType, role, source } = calMeta;
 
-  // FIXED: Dynamic Concurrency Guard Stagger Lock to force pick-up leg webhooks to wait 2 seconds
+  // Dynamic Concurrency Guard Stagger Lock
   if (role === 'pickup') {
     console.log(`[Concurrency Lock] Staggering pickup webhook for 2 seconds to allow dropoff to write first...`);
     await new Promise(resolve => setTimeout(resolve, 2000));
   }
+
+  const prefilled = _flatContact ? {
+    name:  _flatContact.full_name || _flatContact.contact?.fullName || [_flatContact.first_name || _flatContact.contact?.firstName, _flatContact.last_name || _flatContact.contact?.lastName].filter(Boolean).join(' ') || null,
+    email: _flatContact.email || _flatContact.contact?.email || null,
+    phone: _flatContact.phone || _flatContact.contact?.phone || null,
+  } : null;
 
   const existingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
   const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
@@ -630,6 +628,10 @@ async function processAppointment(payload, eventType) {
 
   if (existingStays && existingStays.length > 0) {
     const stay = existingStays[0];
+    const contactLookup = (!stay.dog_name || !stay.kennel_type) ? await getContact(contactId).catch(() => null) : null;
+    const dogName = resolveDogName(_flatContact) || resolveDogName(contactLookup);
+    const kennelCat = resolveKennelCategory(contactLookup, _flatContact);
+
     const updatePayload = {
       [role === 'dropoff' ? 'start_date' : 'end_date']: role === 'dropoff' ? cleanStartTime : cleanEndTime,
       ghl_date_added: appointmentBookedAt,
@@ -637,6 +639,11 @@ async function processAppointment(payload, eventType) {
       last_synced_at: new Date().toISOString(),
     };
 
+    if (!stay.dog_name && dogName) updatePayload.dog_name = dogName;
+    if (!stay.kennel_type && kennelCat) {
+      updatePayload.kennel_type = kennelCat.kennel_type;
+      updatePayload.graduation_status = kennelCat.kennel_grad_status; 
+    }
     if (ghlStatus === 'cancelled') updatePayload.status = 'cancelled';
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
@@ -678,7 +685,7 @@ async function processAppointment(payload, eventType) {
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
       ...(() => {
         const cat = resolveKennelCategory(contact, payload) ||
-                    (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, kennel_grad_status: pairableStay.graduation_status } : null);
+                    (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, graduation_status: pairableStay.graduation_status } : null);
         return cat ? { kennel_type: cat.kennel_type, graduation_status: cat.kennel_grad_status } : {};
       })(),
     };
@@ -784,7 +791,7 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
@@ -837,13 +844,14 @@ app.post('/webhook/ghl', async (req, res) => {
   console.log('RAW WEBHOOK BODY:', JSON.stringify(req.body, null, 2));
 
   const body = req.body;
+  const query = req.query || {}; 
 
-  if (isContactWebhook(body)) {
-    const contactId  = body.contactId || body.contact_id || body.id;
-    const phone       = body.phone;
-    const email       = body.email;
-    const ownerName   = body.full_name || body.fullName ||
-      [body.first_name || body.firstName, body.last_name || body.lastName].filter(Boolean).join(' ') || null;
+  if (isContactWebhook(body, query)) {
+    const contactId  = body.contact_id || body.contactId || body.contact?.id || body.contact?.contact_id || body.id;
+    const phone       = body.phone || body.contact?.phone;
+    const email       = body.email || body.contact?.email;
+    const ownerName   = body.full_name || body.fullName || body.contact?.fullName || body.contact?.full_name ||
+      [body.first_name || body.firstName || body.contact?.firstName, body.last_name || body.lastName || body.contact?.lastName].filter(Boolean).join(' ') || null;
 
     console.log(`Contact webhook received — contactId: ${contactId}`);
 
@@ -878,31 +886,34 @@ app.post('/webhook/ghl', async (req, res) => {
       status:     apptStatus,
       dateAdded:  cal.date_created || body.date_created,
       title:      cal.title,
-      contactId:  body.contact_id,
-      ownerName:  body.full_name || [body.first_name, body.last_name].filter(Boolean).join(' '),
-      ownerEmail: body.email,
-      ownerPhone: body.phone,
+      contactId:  body.contact_id || body.contactId || body.contact?.id || body.id, 
+      ownerName:  body.full_name || [body.first_name || body.contact?.firstName, body.last_name || body.contact?.lastName].filter(Boolean).join(' '),
+      ownerEmail: body.email || body.contact?.email,
+      ownerPhone: body.phone || body.contact?.phone,
       _flatContact: body,
     };
 
     console.log(`Workflow webhook → normalised as ${type} — appointmentId: ${payload.id} calendarId: ${payload.calendarId}`);
   } else {
-    type = body.type || body.eventType || body.event || body.eventName;
-    const appointmentId = body.id || body.appointmentId || body.appointment_id;
+    const apptStatus = (body.status || body.appointmentStatus || query.status || 'confirmed').toLowerCase();
+    const rawType = body.type || body.eventType || body.event || body.eventName;
+    type = (rawType === 'AppointmentDelete' || apptStatus === 'cancelled') ? 'AppointmentDelete' : 'AppointmentCreate';
+    
+    const appointmentId = body.id || body.appointmentId || body.appointment_id || query.appointment_id || query.appointmentId;
 
     payload = {
       ...body,
       id:         appointmentId,
-      contactId:  body.contactId  || body.contact_id,
-      calendarId: body.calendarId || body.calendar_id,
-      startTime:  body.startTime  || body.start_time,
-      endTime:    body.endTime    || body.end_time,
-      status:     body.status     || body.appointmentStatus,
-      dateAdded:  body.dateAdded  || body.date_added || body.createdAt,
+      contactId:  body.contactId  || body.contact_id || body.contact?.id || query.contact_id || query.contactId || body.id, 
+      calendarId: body.calendarId || body.calendar_id || query.calendar_id || query.calendarId,
+      startTime:  body.startTime  || body.start_time  || query.start_time  || query.startTime,
+      endTime:    body.endTime    || body.end_time    || query.end_time    || query.endTime,
+      status:     apptStatus,
+      dateAdded:  body.dateAdded  || body.date_added  || body.createdAt || new Date().toISOString(),
       _flatContact: body,
     };
 
-    console.log(`Standard webhook: ${type} — appointmentId: ${appointmentId}`);
+    console.log(`Standard/Workflow URL webhook normalized: ${type} — appointmentId: ${appointmentId} calendarId: ${payload.calendarId}`);
   }
 
   try {
@@ -949,60 +960,6 @@ app.get('/api/stays', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-const BUSINESS_TIMEZONE = 'America/New_York';
-function getDateStringInTZ(date, timeZone = BUSINESS_TIMEZONE) {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-  });
-  return formatter.format(date);
-}
-
-async function buildDashboardForDate(targetDateStr) {
-  const now = new Date();
-  const resolvedDate = targetDateStr || getDateStringInTZ(now);
-
-  const { data: allStays } = await supabase
-    .from('boarding_stays')
-    .select('*')
-    .neq('status', 'cancelled');
-
-  const arrivals   = (allStays || []).filter(s => s.start_date && getDateStringInTZ(new Date(s.start_date)) === resolvedDate);
-  const departures = (allStays || []).filter(s => s.end_date   && getDateStringInTZ(new Date(s.end_date))   === resolvedDate);
-
-  const active = (allStays || []).filter(s => {
-    if (!s.start_date) return false;
-    const startStr = getDateStringInTZ(new Date(s.start_date));
-    if (startStr > resolvedDate) return false;
-    if (!s.end_date) return true;
-    const endStr = getDateStringInTZ(new Date(s.end_date));
-    return endStr >= resolvedDate;
-  });
-
-  const [pendingRes, incompleteRes] = await Promise.all([
-    supabase.from('boarding_stays').select('*').eq('status', 'requested'),
-    supabase.from('boarding_stays').select('*').eq('status', 'incomplete'),
-  ]);
-
-  const kennelOccupancy = await getKennelOccupancySummary(resolvedDate);
-
-  return {
-    date: resolvedDate,
-    arrivals,
-    departures,
-    active,
-    pending:    pendingRes.data    || [],
-    incomplete: incompleteRes.data || [],
-    counts: {
-      arrivals:   arrivals.length,
-      departures: departures.length,
-      active:     active.length,
-      pending:    pendingRes.data?.length    || 0,
-      incomplete: incompleteRes.data?.length || 0,
-    },
-    kennelOccupancy,
-  };
-}
 
 app.get('/api/dashboard/today', async (req, res) => {
   try {
@@ -1171,7 +1128,7 @@ app.patch('/api/stays/:id/reschedule', async (req, res) => {
 
     const { data: stay, error } = await supabase
       .from('boarding_stays').select('*').eq('id', id).single();
-    if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
+    if (!stay) return res.status(404).json({ error: 'Stay not found' });
 
     const promises = [];
     if (start_date && stay.ghl_dropoff_appointment_id) {
