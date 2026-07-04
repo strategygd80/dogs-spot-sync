@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend (graduation_status Mapped)
+// The Dogs Spot — GHL Sync Backend (Staggered Concurrency Fix)
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -255,33 +255,6 @@ function resolveDogName(contact) {
 // ------------------------------------------------------------
 // AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
 // ------------------------------------------------------------
-const KENNEL_CATEGORY_MAP = {
-  'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
-  'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
-  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special need - non-graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special needs - non-graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special need - in-process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special needs - in-process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
-  'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
-  'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
-  'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
-  'regular - non-graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
-  'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
-  'regular - in-process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
-  'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
-  'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
-  'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
-  'small - non-graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
-  'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
-  'small - in-process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
-  'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
-};
-
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
@@ -430,7 +403,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT PROFILE UPDATES (graduation_status RESTORED)
+// PROCESS CONTACT PROFILE UPDATES (graduation_status Mapped)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -449,7 +422,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (dogName)   fieldUpdate.dog_name    = dogName;
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // FIXED: Mapped database key directly to graduation_status
+    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // Aligned with Supabase column name
     fieldUpdate.kennel_id         = null;
     fieldUpdate.kennel_status     = 'unassigned';
   }
@@ -629,10 +602,6 @@ async function processAppointment(payload, eventType) {
     phone: _flatContact.phone || null,
   } : null;
 
-  const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
-  const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
-  const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
-  
   const calMeta = CALENDAR_LOOKUP[calendarId];
 
   if (!calMeta) {
@@ -641,7 +610,17 @@ async function processAppointment(payload, eventType) {
   }
 
   const { serviceType, role, source } = calMeta;
+
+  // FIXED: Dynamic Concurrency Guard Stagger Lock to force pick-up leg webhooks to wait 2 seconds
+  if (role === 'pickup') {
+    console.log(`[Concurrency Lock] Staggering pickup webhook for 2 seconds to allow dropoff to write first...`);
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+
   const existingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
+  const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
+  const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
+  const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
   
   const { data: existingStays } = await supabase
     .from('boarding_stays')
@@ -697,7 +676,6 @@ async function processAppointment(payload, eventType) {
       owner_phone: pairableStay.owner_phone || ownerPhone,
       dog_name:    pairableStay.dog_name    || resolveDogName(_flatContact) || resolveDogName(contact),
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
-      // FIXED: Mapped database insert targets directly to graduation_status
       ...(() => {
         const cat = resolveKennelCategory(contact, payload) ||
                     (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, kennel_grad_status: pairableStay.graduation_status } : null);
@@ -722,7 +700,6 @@ async function processAppointment(payload, eventType) {
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
       ghl_date_added: appointmentBookedAt,
-      // FIXED: Mapped database insert targets directly to graduation_status
       ...(() => {
         const cat = resolveKennelCategory(contact, payload);
         return cat ? { kennel_type: cat.kennel_type, graduation_status: cat.kennel_grad_status } : {};
@@ -807,7 +784,7 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
@@ -818,12 +795,14 @@ async function autoHealTimelineQueue() {
         console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
         
         const isDropoff = missingRole === 'dropoff';
+        const targetCalId = matchingLeg.calendarId;
+        const source = CALENDAR_LOOKUP[targetCalId]?.source || 'internal';
         const status = await determineStatus(source, stay.contact_id);
         const cleanLegTime = new Date(matchingLeg.startTime || matchingLeg.start_time).toISOString();
 
         const updatePayload = {
           [isDropoff ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id']: matchingLeg.id || matchingLeg.appointmentId,
-          [isDropoff ? 'dropoff_calendar_id' : 'pickup_calendar_id']: matchingLeg.calendarId,
+          [isDropoff ? 'dropoff_calendar_id' : 'pickup_calendar_id']: targetCalId,
           [isDropoff ? 'start_date' : 'end_date']: cleanLegTime,
           status,
           last_modified_source: 'ghl',
