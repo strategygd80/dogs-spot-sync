@@ -196,7 +196,6 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
-// FIXED: Patched query parameters format loop to natively call GHL V2 Location events path with search ranges
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
   const now = new Date();
@@ -206,105 +205,102 @@ async function getContactAppointments(contactId) {
   return res.data?.events || res.data?.appointments || [];
 }
 
-const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
+// ------------------------------------------------------------
+// AIRTIGHT CUSTOM FIELD VALUE EXTRACTOR
+// ------------------------------------------------------------
+function getCustomFieldValue(payload, fieldIds, namedKeys) {
+  if (!payload) return null;
 
-function resolveDogName(contact) {
-  if (!contact) return null;
+  if (namedKeys) {
+    for (const key of namedKeys) {
+      if (payload[key] && String(payload[key]).trim()) {
+        return String(payload[key]).trim();
+      }
+    }
+  }
 
-  const flatDog = contact["Dog's Name"] || contact['dogs_name'] || contact['dog_name'];
-  if (flatDog && String(flatDog).trim()) return String(flatDog).trim();
+  if (fieldIds) {
+    for (const id of fieldIds) {
+      if (payload[id] && String(payload[id]).trim()) {
+        return String(payload[id]).trim();
+      }
+    }
+  }
 
-  const customFields = contact.customFields || contact.customField || [];
-  if (Array.isArray(customFields)) {
-    for (const fieldId of DOG_NAME_FIELD_IDS) {
-      const entry = customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
-      const value = entry?.value || entry?.fieldValue || null;
-      if (value && String(value).trim()) return String(value).trim();
+  const cFields = payload.customFields || payload.customField || payload.custom_fields;
+  if (cFields) {
+    if (Array.isArray(cFields)) {
+      for (const id of fieldIds) {
+        const entry = cFields.find(f => f && (f.id === id || f.fieldId === id));
+        const val = entry?.value || entry?.fieldValue;
+        if (val && String(val).trim()) return String(val).trim();
+      }
+    } else if (typeof cFields === 'object') {
+      for (const id of fieldIds) {
+        if (cFields[id] && String(cFields[id]).trim()) {
+          return String(cFields[id]).trim();
+        }
+      }
     }
   }
   return null;
 }
 
-// FIXED: Expanded dictionary lookup keys to natively map both hyphenated and non-hyphenated GHL payload variants
-const KENNEL_CATEGORY_MAP = {
-  // Special Needs - Graduated
-  'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
-  'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
-  
-  // Special Needs - Non-Graduate (With and Without Hyphens)
-  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special need - non-graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special needs - non-graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  
-  // Special Needs - In Process
-  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special need - in-process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  'special needs - in-process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
-  
-  // Base Fallbacks
-  'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
-  'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
-  
-  // Regular - Graduated
-  'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
-  
-  // Regular - Non-Graduate (With and Without Hyphens)
-  'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
-  'regular - non-graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
-  
-  // Regular - In Process
-  'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
-  'regular - in-process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
-  'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
-  
-  // Small - Graduated
-  'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
-  
-  // Small - Non-Graduate (With and Without Hyphens)
-  'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
-  'small - non-graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
-  
-  // Small - In Process
-  'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
-  'small - in-process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
-  'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
-};
+const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 
-// FIXED: Added defensive parsing block to catch unexpected nested structure changes securely
+function resolveDogName(contact) {
+  return getCustomFieldValue(contact, DOG_NAME_FIELD_IDS, ["Dog's Name", "dogs_name", "dog_name"]);
+}
+
+// ------------------------------------------------------------
+// AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
+// Takes combined layout entries from GHL and automatically isolates
+// the physical run type from the client program graduation status.
+// ------------------------------------------------------------
 function resolveKennelCategory(contact, flatPayload) {
   try {
-    let raw = null;
-    if (flatPayload) raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
-    
-    if (!raw && flatPayload?.customFields && Array.isArray(flatPayload.customFields)) {
-      for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
-        const entry = flatPayload.customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
-        if (entry && (entry.value || entry.fieldValue)) {
-          raw = entry.value || entry.fieldValue;
-          break;
-        }
-      }
-    }
-
-    if (!raw && contact) {
-      const customFields = contact.customFields || contact.customField || [];
-      if (Array.isArray(customFields)) {
-        for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
-          const entry = customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
-          const val = entry?.value || entry?.fieldValue || null;
-          if (val) { raw = val; break; }
-        }
-      }
-      if (!raw) raw = contact['Kennel Category'] || contact['kennel_category'];
+    let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
+    if (!raw) {
+      raw = getCustomFieldValue(contact, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
     }
 
     if (!raw) return null;
-    const key = String(raw).trim().toLowerCase();
-    return KENNEL_CATEGORY_MAP[key] || null;
+
+    // Standardize text arrays and clean up multiple space offsets
+    const normalized = String(raw).replace(/\s+/g, ' ').trim();
+    
+    // Dynamic Split Engine: Cuts the text string right down the middle at the hyphen
+    const parts = normalized.split(/\s*-\s*/);
+    const typePart = parts[0] ? parts[0].trim().toLowerCase() : '';
+    const gradPart = parts[1] ? parts[1].trim().toLowerCase() : null;
+
+    // Pass 1: Resolve the physical kennel area mapping configuration
+    let kennel_type = 'regular';
+    if (typePart.includes('special')) {
+      kennel_type = 'special_needs';
+    } else if (typePart.includes('small')) {
+      kennel_type = 'small';
+    } else if (typePart.includes('overflow')) {
+      kennel_type = 'overflow';
+    } else if (typePart.includes('regular')) {
+      kennel_type = 'regular';
+    }
+
+    // Pass 2: Resolve and output the exact graduation step tag metrics
+    let kennel_grad_status = null;
+    if (gradPart) {
+      if (gradPart.includes('non') || gradPart.includes('un')) {
+        kennel_grad_status = 'non_graduate';
+      } else if (gradPart.includes('grad')) {
+        kennel_grad_status = 'graduated';
+      } else if (gradPart.includes('process')) {
+        kennel_grad_status = 'in_process';
+      }
+    }
+
+    return { kennel_type, kennel_grad_status };
   } catch (err) {
-    console.error("Error within resolveKennelCategory parser:", err.message);
+    console.error("Error encountered within resolveKennelCategory parser:", err.message);
     return null;
   }
 }
@@ -414,7 +410,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT PROFILE UPDATES (Strict Profile Metadata - Restored)
+// PROCESS CONTACT UPDATE (Strict Field Rewrites Only)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -478,7 +474,6 @@ async function getAllKennels() {
   return data || [];
 }
 
-// FIXED: Swapped loose string operations out to process numeric Unix timestamps, fixing the 'unassigned' dashboard room bug
 function rangesOverlap(aStart, aEnd, bStart, bEnd) {
   if (!aStart || !bStart) return false;
   const tAStart = new Date(aStart).getTime();
@@ -614,7 +609,6 @@ async function processAppointment(payload, eventType) {
     phone: _flatContact.phone || null,
   } : null;
 
-  // FIXED: Converts raw webhook times to standard ISO strings when saving/updating
   const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
   const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
   const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
@@ -763,7 +757,6 @@ const MAX_STAY_DAYS = 90;
 
 async function autoHealTimelineQueue() {
   try {
-    // FIXED: Appended explicit .select('*') query blueprint parameters to prevent execution errors
     const { data: incompleteStays } = await supabase
       .from('boarding_stays')
       .select('*')
