@@ -321,7 +321,6 @@ async function isReturningClient(contactId) {
 
 // ------------------------------------------------------------
 // DETERMINE STATUS
-// FIXED: Anchored root level definition sequence
 // ------------------------------------------------------------
 async function determineStatus(source, contactId) {
   if (source === 'internal') return 'confirmed';
@@ -461,6 +460,18 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   }
 
   console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
+}
+
+async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
+  await supabase.from('sync_log').insert({
+    stay_id: stayId || null,
+    ghl_appointment_id: ghlAppointmentId || null,
+    direction,
+    action,
+    payload,
+    status,
+    error_message: errorMessage,
+  });
 }
 
 // ------------------------------------------------------------
@@ -791,13 +802,14 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
         return true;
       });
 
+      // FIXED: Restored variable scope configurations completely
       if (matchingLeg && (matchingLeg.id || matchingLeg.appointmentId)) {
         console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
         
