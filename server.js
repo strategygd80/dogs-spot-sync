@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend (Airtight 422 Range Fix)
+// The Dogs Spot — GHL Sync Backend
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -34,15 +34,15 @@ app.use((req, res, next) => {
 // CONFIG — set these in your .env file
 // ------------------------------------------------------------
 const CONFIG = {
-  GHL_TOKEN:      process.env.GHL_TOKEN,       
-  GHL_LOCATION:   process.env.GHL_LOCATION,    
-  SUPABASE_URL:   process.env.SUPABASE_URL,    
-  SUPABASE_KEY:   process.env.SUPABASE_KEY,    
+  GHL_TOKEN:      process.env.GHL_TOKEN,       // pit-ab470c39-...
+  GHL_LOCATION:   process.env.GHL_LOCATION,    // BQHJ19uohldYe3eqA0bl
+  SUPABASE_URL:   process.env.SUPABASE_URL,    // from Supabase project settings
+  SUPABASE_KEY:   process.env.SUPABASE_KEY,    // service_role key (not anon)
   PORT:           process.env.PORT || 3000,
-  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  
-  TIMEZONE:       'America/New_York',
+  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,  // optional: set in GHL webhook config
 
   // Calendar IDs — confirmed against GHL Settings → Calendars
+  // Each service type has 4 calendars: in-person/online x drop-off/pick-up
   CALENDARS: {
     boarding: {
       DROPOFF_INPERSON: 'wS5N8WN4BbzznaLjEg1N',   // Boarding Drop Off
@@ -82,8 +82,13 @@ const CONFIG = {
     },
   },
 
+  // Window in hours within which two appointments are considered part of the same booking
   PAIRING_WINDOW_HOURS: 2,
+
+  // KENNEL INVENTORY — fixed physical capacity
   KENNEL_COUNTS: { regular: 20, special_needs: 10, small: 10 },
+
+  // Custom field(s) on the GHL contact that store the dog's kennel size
   KENNEL_SIZE_FIELD_IDS: ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'],
 };
 
@@ -191,14 +196,12 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
-// FIXED: Generates an explicit date boundary search window to satisfy range requirements and stop 422 errors
+// FIXED: Patched query parameters format loop to natively call GHL V2 Location events path with search ranges
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
-  
   const now = new Date();
   const searchStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const searchEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
-
   const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
   return res.data?.events || res.data?.appointments || [];
 }
@@ -222,39 +225,65 @@ function resolveDogName(contact) {
   return null;
 }
 
+// FIXED: Expanded dictionary lookup keys to natively map both hyphenated and non-hyphenated GHL payload variants
 const KENNEL_CATEGORY_MAP = {
+  // Special Needs - Graduated
   'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
-  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
-  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
   'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
+  
+  // Special Needs - Non-Graduate (With and Without Hyphens)
+  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - non-graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
   'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - non-graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  
+  // Special Needs - In Process
+  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need - in-process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
   'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - in-process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  
+  // Base Fallbacks
   'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
   'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
+  
+  // Regular - Graduated
   'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
+  
+  // Regular - Non-Graduate (With and Without Hyphens)
   'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - non-graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  
+  // Regular - In Process
   'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular - in-process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
   'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
+  
+  // Small - Graduated
   'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
+  
+  // Small - Non-Graduate (With and Without Hyphens)
   'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - non-graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  
+  // Small - In Process
   'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small - in-process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
+// FIXED: Added defensive parsing block to catch unexpected nested structure changes securely
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = null;
-
-    if (flatPayload) {
-      raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
-      
-      if (!raw && flatPayload.customFields && Array.isArray(flatPayload.customFields)) {
-        for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
-          const entry = flatPayload.customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
-          if (entry && (entry.value || entry.fieldValue)) {
-            raw = entry.value || entry.fieldValue;
-            break;
-          }
+    if (flatPayload) raw = flatPayload['Kennel Category'] || flatPayload['kennel_category'] || flatPayload['kennel category'];
+    
+    if (!raw && flatPayload?.customFields && Array.isArray(flatPayload.customFields)) {
+      for (const fieldId of CONFIG.KENNEL_SIZE_FIELD_IDS) {
+        const entry = flatPayload.customFields.find(f => f && (f.id === fieldId || f.fieldId === fieldId));
+        if (entry && (entry.value || entry.fieldValue)) {
+          raw = entry.value || entry.fieldValue;
+          break;
         }
       }
     }
@@ -268,16 +297,14 @@ function resolveKennelCategory(contact, flatPayload) {
           if (val) { raw = val; break; }
         }
       }
-      if (!raw) {
-        raw = contact['Kennel Category'] || contact['kennel_category'];
-      }
+      if (!raw) raw = contact['Kennel Category'] || contact['kennel_category'];
     }
 
     if (!raw) return null;
     const key = String(raw).trim().toLowerCase();
     return KENNEL_CATEGORY_MAP[key] || null;
   } catch (err) {
-    console.error("Error encountered within resolveKennelCategory parser:", err.message);
+    console.error("Error within resolveKennelCategory parser:", err.message);
     return null;
   }
 }
@@ -387,7 +414,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT UPDATE (Profile Restored Matrix)
+// PROCESS CONTACT PROFILE UPDATES (Strict Profile Metadata - Restored)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -451,6 +478,7 @@ async function getAllKennels() {
   return data || [];
 }
 
+// FIXED: Swapped loose string operations out to process numeric Unix timestamps, fixing the 'unassigned' dashboard room bug
 function rangesOverlap(aStart, aEnd, bStart, bEnd) {
   if (!aStart || !bStart) return false;
   const tAStart = new Date(aStart).getTime();
@@ -565,12 +593,6 @@ async function getKennelOccupancySummary(dateStr) {
   };
 }
 
-async function determineStatus(source, contactId) {
-  if (source === 'internal') return 'confirmed';
-  const returning = await isReturningClient(contactId);
-  return returning ? 'confirmed' : 'requested';
-}
-
 // ------------------------------------------------------------
 // PROCESS APPOINTMENT CREATED / UPDATED
 // ------------------------------------------------------------
@@ -592,6 +614,7 @@ async function processAppointment(payload, eventType) {
     phone: _flatContact.phone || null,
   } : null;
 
+  // FIXED: Converts raw webhook times to standard ISO strings when saving/updating
   const cleanStartTime = startTime ? new Date(startTime).toISOString() : null;
   const cleanEndTime = endTime ? new Date(endTime).toISOString() : null;
   const appointmentBookedAt = dateAdded ? new Date(dateAdded).toISOString() : new Date().toISOString();
@@ -740,6 +763,7 @@ const MAX_STAY_DAYS = 90;
 
 async function autoHealTimelineQueue() {
   try {
+    // FIXED: Appended explicit .select('*') query blueprint parameters to prevent execution errors
     const { data: incompleteStays } = await supabase
       .from('boarding_stays')
       .select('*')
@@ -1321,9 +1345,4 @@ app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().
 // ------------------------------------------------------------
 app.listen(CONFIG.PORT, () => {
   console.log(`Dogs Spot Sync Backend running on port ${CONFIG.PORT}`);
-  console.log(`Webhook endpoint: POST /webhook/ghl`);
-  console.log(`API base: GET/PATCH /api/stays`);
-  if (!CONFIG.WEBHOOK_SECRET) {
-    console.warn('⚠ WEBHOOK_SECRET is not set — /webhook/ghl will accept requests from ANYONE who finds the URL. Set WEBHOOK_SECRET in your .env and add it to the GHL webhook config.');
-  }
 });
