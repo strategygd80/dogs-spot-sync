@@ -1,5 +1,5 @@
 // ============================================================
-// The Dogs Spot — GHL Sync Backend
+// The Dogs Spot — GHL Sync Backend (graduation_status Mapped)
 // Node.js / Express — deploy to Render or Railway (free tier)
 // ============================================================
 // Setup:
@@ -197,7 +197,7 @@ async function updateAppointment(appointmentId, payload) {
 }
 
 async function getContactAppointments(contactId) {
-  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH') return [];
+  if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
   const now = new Date();
   const searchStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const searchEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
@@ -254,9 +254,34 @@ function resolveDogName(contact) {
 
 // ------------------------------------------------------------
 // AUTOMATIC KENNEL CATEGORY SPLITTER & PARSER
-// Takes combined layout entries from GHL and automatically isolates
-// the physical run type from the client program graduation status.
 // ------------------------------------------------------------
+const KENNEL_CATEGORY_MAP = {
+  'special need - graduated':    { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
+  'special needs - graduated':   { kennel_type: 'special_needs', kennel_grad_status: 'graduated'    },
+  'special need - non graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - non-graduate': { kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - non graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special needs - non-graduate':{ kennel_type: 'special_needs', kennel_grad_status: 'non_graduate' },
+  'special need - in process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need - in-process':   { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - in process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special needs - in-process':  { kennel_type: 'special_needs', kennel_grad_status: 'in_process'   },
+  'special need':                { kennel_type: 'special_needs', kennel_grad_status: null            },
+  'special needs':               { kennel_type: 'special_needs', kennel_grad_status: null            },
+  'regular - graduated':         { kennel_type: 'regular',       kennel_grad_status: 'graduated'    },
+  'regular - non graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - non-graduate':      { kennel_type: 'regular',       kennel_grad_status: 'non_graduate' },
+  'regular - in process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular - in-process':        { kennel_type: 'regular',       kennel_grad_status: 'in_process'   },
+  'regular':                     { kennel_type: 'regular',       kennel_grad_status: null            },
+  'small - graduated':           { kennel_type: 'small',         kennel_grad_status: 'graduated'    },
+  'small - non graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - non-graduate':        { kennel_type: 'small',         kennel_grad_status: 'non_graduate' },
+  'small - in process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small - in-process':          { kennel_type: 'small',         kennel_grad_status: 'in_process'   },
+  'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
+};
+
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
@@ -266,15 +291,11 @@ function resolveKennelCategory(contact, flatPayload) {
 
     if (!raw) return null;
 
-    // Standardize text arrays and clean up multiple space offsets
     const normalized = String(raw).replace(/\s+/g, ' ').trim();
-    
-    // Dynamic Split Engine: Cuts the text string right down the middle at the hyphen
     const parts = normalized.split(/\s*-\s*/);
     const typePart = parts[0] ? parts[0].trim().toLowerCase() : '';
     const gradPart = parts[1] ? parts[1].trim().toLowerCase() : null;
 
-    // Pass 1: Resolve the physical kennel area mapping configuration
     let kennel_type = 'regular';
     if (typePart.includes('special')) {
       kennel_type = 'special_needs';
@@ -286,7 +307,6 @@ function resolveKennelCategory(contact, flatPayload) {
       kennel_type = 'regular';
     }
 
-    // Pass 2: Resolve and output the exact graduation step tag metrics
     let kennel_grad_status = null;
     if (gradPart) {
       if (gradPart.includes('non') || gradPart.includes('un')) {
@@ -300,7 +320,7 @@ function resolveKennelCategory(contact, flatPayload) {
 
     return { kennel_type, kennel_grad_status };
   } catch (err) {
-    console.error("Error encountered within resolveKennelCategory parser:", err.message);
+    console.error("Error within resolveKennelCategory parser:", err.message);
     return null;
   }
 }
@@ -410,7 +430,7 @@ async function findStaysForContact({ contactId, phone, email }) {
 }
 
 // ------------------------------------------------------------
-// PROCESS CONTACT UPDATE (Strict Field Rewrites Only)
+// PROCESS CONTACT PROFILE UPDATES (graduation_status RESTORED)
 // ------------------------------------------------------------
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName    = resolveDogName(_flatContact);
@@ -429,7 +449,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
   if (dogName)   fieldUpdate.dog_name    = dogName;
   if (kennelCat) {
     fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.kennel_grad_status = kennelCat.kennel_grad_status;
+    fieldUpdate.graduation_status = kennelCat.kennel_grad_status; // FIXED: Mapped database key directly to graduation_status
     fieldUpdate.kennel_id         = null;
     fieldUpdate.kennel_status     = 'unassigned';
   }
@@ -677,10 +697,11 @@ async function processAppointment(payload, eventType) {
       owner_phone: pairableStay.owner_phone || ownerPhone,
       dog_name:    pairableStay.dog_name    || resolveDogName(_flatContact) || resolveDogName(contact),
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
+      // FIXED: Mapped database insert targets directly to graduation_status
       ...(() => {
         const cat = resolveKennelCategory(contact, payload) ||
-                    (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, kennel_grad_status: pairableStay.kennel_grad_status } : null);
-        return cat ? { kennel_type: cat.kennel_type, kennel_grad_status: cat.kennel_grad_status } : {};
+                    (pairableStay.kennel_type ? { kennel_type: pairableStay.kennel_type, kennel_grad_status: pairableStay.graduation_status } : null);
+        return cat ? { kennel_type: cat.kennel_type, graduation_status: cat.kennel_grad_status } : {};
       })(),
     };
 
@@ -701,9 +722,10 @@ async function processAppointment(payload, eventType) {
       last_modified_source: 'ghl',
       last_synced_at: new Date().toISOString(),
       ghl_date_added: appointmentBookedAt,
+      // FIXED: Mapped database insert targets directly to graduation_status
       ...(() => {
         const cat = resolveKennelCategory(contact, payload);
-        return cat ? { kennel_type: cat.kennel_type, kennel_grad_status: cat.kennel_grad_status } : {};
+        return cat ? { kennel_type: cat.kennel_type, graduation_status: cat.kennel_grad_status } : {};
       })(),
       kennel_status: 'needs_size',
       [existingField]: ghlAppointmentId,
@@ -766,7 +788,8 @@ async function autoHealTimelineQueue() {
     if (!incompleteStays || incompleteStays.length === 0) return;
 
     for (const stay of incompleteStays) {
-      if (!stay || !stay.contact_id) continue;
+      if (!stay || !stay.contact_id || stay.contact_id === 'PENDING_POST_SYNC') continue;
+      
       const ghlAppts = await getContactAppointments(stay.contact_id);
       if (!ghlAppts || ghlAppts.length === 0) continue;
 
@@ -784,7 +807,7 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
@@ -795,14 +818,12 @@ async function autoHealTimelineQueue() {
         console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
         
         const isDropoff = missingRole === 'dropoff';
-        const targetCalId = matchingLeg.calendarId;
-        const source = CALENDAR_LOOKUP[targetCalId]?.source || 'internal';
         const status = await determineStatus(source, stay.contact_id);
         const cleanLegTime = new Date(matchingLeg.startTime || matchingLeg.start_time).toISOString();
 
         const updatePayload = {
           [isDropoff ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id']: matchingLeg.id || matchingLeg.appointmentId,
-          [isDropoff ? 'dropoff_calendar_id' : 'pickup_calendar_id']: targetCalId,
+          [isDropoff ? 'dropoff_calendar_id' : 'pickup_calendar_id']: matchingLeg.calendarId,
           [isDropoff ? 'start_date' : 'end_date']: cleanLegTime,
           status,
           last_modified_source: 'ghl',
@@ -1199,9 +1220,9 @@ app.patch('/api/stays/:id/reschedule', async (req, res) => {
 app.patch('/api/stays/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
-    const { data: stay, error } = await supabase
+    const { data: stay, error = null } = await supabase
       .from('boarding_stays').select('*').eq('id', id).single();
-    if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
+    if (!stay) return res.status(404).json({ error: 'Stay not found' });
 
     const promises = [];
     if (stay.ghl_dropoff_appointment_id) {
