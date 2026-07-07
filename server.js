@@ -16,6 +16,11 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
 
+// Serves anything placed in /public — put boarding-booking.html here
+// so it's reachable at https://<your-render-url>/boarding-booking.html
+// with zero extra hosting to set up.
+app.use(express.static('public'));
+
 // ------------------------------------------------------------
 // AUTH LOCKOUT CONSTANTS
 // (previously referenced in /api/auth/login but never defined —
@@ -229,6 +234,53 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
+// Creates a real GHL appointment directly — used by the multi-dog
+// booking endpoint so the dog's name is set with certainty at
+// creation time, instead of being inferred later from a webhook.
+async function createAppointment({ calendarId, contactId, title, startTime, endTime, appointmentStatus }) {
+  const res = await ghl.post('/calendars/events/appointments', {
+    calendarId,
+    locationId: CONFIG.GHL_LOCATION,
+    contactId,
+    title,
+    startTime,
+    endTime,
+    appointmentStatus: appointmentStatus || 'confirmed',
+  });
+  // GHL wraps the created record differently across API versions —
+  // handle both `{ id, ... }` and `{ appointment: { id, ... } } shapes.
+  return res.data?.appointment || res.data;
+}
+
+// Finds the contact by email/phone, or creates one, in a single call.
+async function upsertContact({ email, phone, firstName, lastName }) {
+  const res = await ghl.post('/contacts/upsert', {
+    locationId: CONFIG.GHL_LOCATION,
+    email: email || undefined,
+    phone: phone || undefined,
+    firstName: firstName || undefined,
+    lastName: lastName || undefined,
+  });
+  return res.data?.contact || res.data;
+}
+
+// Simple type-ahead contact search for staff — matches by name, email,
+// or phone against GHL's basic query search.
+async function searchContacts(query) {
+  const res = await ghl.get('/contacts/', {
+    params: { locationId: CONFIG.GHL_LOCATION, query, limit: 10 },
+  });
+  const contacts = res.data?.contacts || [];
+  return contacts.map(c => ({
+    id: c.id,
+    name: c.contactName || c.name || [c.firstName, c.lastName].filter(Boolean).join(' '),
+    firstName: c.firstName || '',
+    lastName: c.lastName || '',
+    email: c.email || '',
+    phone: c.phone || '',
+  }));
+}
+
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
   const now = new Date();
@@ -262,14 +314,15 @@ function getCustomFieldValue(payload, fieldIds, namedKeys) {
     if (!target) return null;
     const cFields = target.customFields || target.customField || target.custom_fields;
     if (!cFields) return null;
+    const ids = fieldIds || [];
     if (Array.isArray(cFields)) {
-      for (const id of fieldIds) {
+      for (const id of ids) {
         const entry = cFields.find(f => f && (f.id === id || f.fieldId === id));
         const val = entry?.value || entry?.fieldValue;
         if (val && String(val).trim()) return String(val).trim();
       }
     } else if (typeof cFields === 'object') {
-      for (const id of fieldIds) {
+      for (const id of ids) {
         if (cFields[id] && String(cFields[id]).trim()) return String(cFields[id]).trim();
       }
     }
@@ -283,6 +336,32 @@ const DOG_NAME_FIELD_IDS = ['MNwzpEaxKwgifkOsvhIb', '9m5zqCls4pQFTdlJJZaI'];
 
 function resolveDogName(contact) {
   return getCustomFieldValue(contact, DOG_NAME_FIELD_IDS, ["Dog's Name", "dogs_name", "dog_name"]);
+}
+
+// ------------------------------------------------------------
+// DOG NAME FROM APPOINTMENT TITLE
+// If the calendar's "Meeting Invite Title" is set to a merge-field
+// template like "{{contact.active_booking_dog_name}} — Boarding Drop
+// Off", the rendered title text becomes a permanent, per-appointment
+// snapshot of the dog's name at the moment that specific appointment
+// was created — unlike a live contact field, which can get
+// overwritten by a later booking for a different dog on the same
+// contact. This is the PREFERRED source when available; expects the
+// dog name to appear before a " - " / " – " / " — " separator.
+// ------------------------------------------------------------
+const TITLE_STATIC_LABELS = new Set([
+  'boarding drop off', 'boarding pick up', 'basic drop off', 'basic pick-up',
+  'leash free drop off', 'leash free pick up', 'service dog drop off', 'service dog pick-up',
+  'community drop off', 'community pick-up', 'bundle drop off', 'bundle pick-up',
+]);
+
+function resolveDogNameFromTitle(title) {
+  if (!title) return null;
+  const parts = String(title).split(/\s[-\u2013\u2014]\s/); // splits on " - ", " – ", " — "
+  if (parts.length < 2) return null;
+  const candidate = parts[0].trim();
+  if (!candidate || TITLE_STATIC_LABELS.has(candidate.toLowerCase())) return null;
+  return candidate;
 }
 
 // ------------------------------------------------------------
@@ -315,43 +394,49 @@ const KENNEL_CATEGORY_MAP = {
   'small':                       { kennel_type: 'small',         kennel_grad_status: null            },
 };
 
+// Parses a kennel category label into { kennel_type, kennel_grad_status }.
+// Deliberately format-agnostic: your dropdown options mix styles —
+// some use a dash ("Small - Graduated"), others don't and include a
+// price ("Regular Boarding Graduate $30 per day"). Rather than relying
+// on a separator, this just looks for the relevant keywords anywhere
+// in the string, so both styles (and any price/day suffix) parse the
+// same way.
+function parseKennelCategoryText(raw) {
+  if (!raw) return null;
+  const normalized = String(raw).toLowerCase();
+
+  let kennel_type = 'regular';
+  if (normalized.includes('special')) {
+    kennel_type = 'special_needs';
+  } else if (normalized.includes('small')) {
+    kennel_type = 'small';
+  } else if (normalized.includes('overflow')) {
+    kennel_type = 'overflow';
+  } else if (normalized.includes('regular')) {
+    kennel_type = 'regular';
+  }
+
+  // Check "non-graduate" before generic "graduate" — it's a substring
+  // of it, so order matters here.
+  let kennel_grad_status = null;
+  if (normalized.includes('non-graduate') || normalized.includes('non graduate') || normalized.includes('nongraduate') || normalized.includes('non-grad')) {
+    kennel_grad_status = 'non_graduate';
+  } else if (normalized.includes('in process') || normalized.includes('in-process')) {
+    kennel_grad_status = 'in_process';
+  } else if (normalized.includes('graduate') || normalized.includes('graduated')) {
+    kennel_grad_status = 'graduated';
+  }
+
+  return { kennel_type, kennel_grad_status };
+}
+
 function resolveKennelCategory(contact, flatPayload) {
   try {
     let raw = getCustomFieldValue(flatPayload, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
     if (!raw) {
       raw = getCustomFieldValue(contact, CONFIG.KENNEL_SIZE_FIELD_IDS, ['Kennel Category', 'kennel_category', 'kennel category']);
     }
-
-    if (!raw) return null;
-
-    const normalized = String(raw).replace(/\s+/g, ' ').trim();
-    const parts = normalized.split(/\s*-\s*/);
-    const typePart = parts[0] ? parts[0].trim().toLowerCase() : '';
-    const gradPart = parts[1] ? parts[1].trim().toLowerCase() : null;
-
-    let kennel_type = 'regular';
-    if (typePart.includes('special')) {
-      kennel_type = 'special_needs';
-    } else if (typePart.includes('small')) {
-      kennel_type = 'small';
-    } else if (typePart.includes('overflow')) {
-      kennel_type = 'overflow';
-    } else if (typePart.includes('regular')) {
-      kennel_type = 'regular';
-    }
-
-    let kennel_grad_status = null;
-    if (gradPart) {
-      if (gradPart.includes('non') || gradPart.includes('un')) {
-        kennel_grad_status = 'non_graduate';
-      } else if (gradPart.includes('grad')) {
-        kennel_grad_status = 'graduated';
-      } else if (gradPart.includes('process')) {
-        kennel_grad_status = 'in_process';
-      }
-    }
-
-    return { kennel_type, kennel_grad_status };
+    return parseKennelCategoryText(raw);
   } catch (err) {
     console.error("Error within resolveKennelCategory parser:", err.message);
     return null;
@@ -394,7 +479,7 @@ async function getContact(contactId) {
 const BOARDING_PAIRING_WINDOW_HOURS = 24;
 
 async function findPairableStay(identity, appointmentBookedAt, role, serviceType) {
-  const { contactId, phone, email } = identity;
+  const { contactId, phone, email, dogName } = identity;
   const group = pairingGroupOf(serviceType);
 
   const missingField = role === 'dropoff' ? 'ghl_dropoff_appointment_id' : 'ghl_pickup_appointment_id';
@@ -422,7 +507,7 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   const { data, error } = await query;
   if (error || !data || data.length === 0) return null;
 
-  const candidates = data.filter(row => {
+  let candidates = data.filter(row => {
     if (contactId && row.contact_id === contactId) return true;
     if (normPhone && normalizePhone(row.owner_phone) === normPhone) return true;
     if (normEmail && row.owner_email && String(row.owner_email).trim().toLowerCase() === normEmail) return true;
@@ -430,6 +515,26 @@ async function findPairableStay(identity, appointmentBookedAt, role, serviceType
   });
 
   if (candidates.length === 0) return null;
+
+  // ------------------------------------------------------------
+  // DOG-LEVEL DISAMBIGUATION
+  // A single contact can have more than one dog boarding at once —
+  // matching purely on contact/phone/email would risk pairing Dog A's
+  // dropoff with Dog B's pickup when both share an owner and land in
+  // the same time window. When we know the incoming dog's name, we
+  // narrow the candidate pool to stays that either (a) already carry
+  // the same dog name, or (b) don't have a dog name recorded yet
+  // (safe to pair — most likely this same dog's other leg, just not
+  // yet confirmed). Candidates known to belong to a *different* named
+  // dog are excluded outright rather than risking a wrong merge.
+  // ------------------------------------------------------------
+  if (dogName && candidates.length > 1) {
+    const norm = s => String(s).trim().toLowerCase();
+    const sameNamed = candidates.filter(c => c.dog_name && norm(c.dog_name) === norm(dogName));
+    const unnamed   = candidates.filter(c => !c.dog_name);
+    candidates = sameNamed.length ? sameNamed : unnamed;
+    if (candidates.length === 0) return null; // every remaining candidate belongs to a different, known dog
+  }
 
   if (group === 'boarding') {
     const targetTime = new Date(appointmentBookedAt).getTime();
@@ -476,9 +581,28 @@ async function findStaysForContact({ contactId, phone, email }) {
 // ------------------------------------------------------------
 // PROCESS CONTACT PROFILE UPDATES
 // ------------------------------------------------------------
+// Per-dog kennel category custom fields, set on the CONTACT (used
+// for first-time clients: staff assigns these after intake, once per
+// dog, since the client didn't know their dog's category at booking
+// time). Position 1/2/3 is matched to whichever of the contact's
+// currently-open stays was created first/second/third — since our
+// booking flow creates dog 1's stay before dog 2's before dog 3's,
+// sorting by creation time recovers the same order these fields were
+// filled in.
+const PER_DOG_KENNEL_CATEGORY_KEYS = [
+  ['kennel_category'],    // dog 1
+  ['kennel_category_2'],  // dog 2
+  ['kennel_category_3'],  // dog 3
+];
+
+function resolvePerDogKennelCategory(flatPayload, dogIndex) {
+  const raw = getCustomFieldValue(flatPayload, null, PER_DOG_KENNEL_CATEGORY_KEYS[dogIndex]);
+  if (!raw) return null;
+  return parseKennelCategoryText(raw);
+}
+
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
-  const dogName    = resolveDogName(_flatContact);
-  const kennelCat  = resolveKennelCategory(null, _flatContact);
+  const dogName = resolveDogName(_flatContact);
 
   const stays = await findStaysForContact({ contactId, phone, email });
   if (stays.length === 0) {
@@ -486,35 +610,65 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
     return;
   }
 
-  const fieldUpdate = {};
-  if (ownerName) fieldUpdate.owner_name  = ownerName;
-  if (email)     fieldUpdate.owner_email = email;
-  if (phone)     fieldUpdate.owner_phone = phone;
-  if (dogName)   fieldUpdate.dog_name    = dogName;
-  if (kennelCat) {
-    fieldUpdate.kennel_type       = kennelCat.kennel_type;
-    fieldUpdate.graduation_status = kennelCat.kennel_grad_status;
-    fieldUpdate.kennel_id         = null;
-    fieldUpdate.kennel_status     = 'unassigned';
-  }
+  // Shared fields apply to every stay on this contact.
+  const sharedUpdate = {};
+  if (ownerName) sharedUpdate.owner_name  = ownerName;
+  if (email)     sharedUpdate.owner_email = email;
+  if (phone)     sharedUpdate.owner_phone = phone;
 
-  if (Object.keys(fieldUpdate).length === 0) {
-    console.log(`Contact update for ${contactId}: no usable fields in payload, nothing to sync`);
-    return;
-  }
+  // Order the contact's open stays the same way they were created
+  // (dog 1 first), so per-dog fields line up with the right stay.
+  const openStays = [...stays]
+    .filter(s => !['cancelled', 'completed'].includes(s.status))
+    .sort((a, b) => {
+      const ta = a.ghl_date_added ? new Date(a.ghl_date_added).getTime() : 0;
+      const tb = b.ghl_date_added ? new Date(b.ghl_date_added).getTime() : 0;
+      return ta - tb;
+    });
 
-  fieldUpdate.last_modified_source = 'ghl';
-  fieldUpdate.last_synced_at = new Date().toISOString();
+  let syncedCount = 0;
 
-  for (const stay of stays) {
-    await supabase.from('boarding_stays').update(fieldUpdate).eq('id', stay.id);
+  for (let i = 0; i < openStays.length; i++) {
+    const stay = openStays[i];
+    const stayUpdate = { ...sharedUpdate };
+
+    if (openStays.length === 1) {
+      // Only one dog on this contact — no ambiguity, accept either the
+      // dog-1 slot or the single legacy "Dog's Name"/"Kennel Category" field.
+      if (dogName && !stay.dog_name) stayUpdate.dog_name = dogName;
+      const cat = resolvePerDogKennelCategory(_flatContact, 0) || resolveKennelCategory(null, _flatContact);
+      if (cat) {
+        stayUpdate.kennel_type       = cat.kennel_type;
+        stayUpdate.graduation_status = cat.kennel_grad_status;
+        stayUpdate.kennel_id         = null;
+        stayUpdate.kennel_status     = 'unassigned';
+      }
+    } else {
+      // Multiple dogs on this contact — only apply the category field
+      // that matches THIS dog's position, never all three at once.
+      const cat = resolvePerDogKennelCategory(_flatContact, i);
+      if (cat) {
+        stayUpdate.kennel_type       = cat.kennel_type;
+        stayUpdate.graduation_status = cat.kennel_grad_status;
+        stayUpdate.kennel_id         = null;
+        stayUpdate.kennel_status     = 'unassigned';
+      }
+    }
+
+    if (Object.keys(stayUpdate).length === 0) continue;
+
+    stayUpdate.last_modified_source = 'ghl';
+    stayUpdate.last_synced_at = new Date().toISOString();
+
+    await supabase.from('boarding_stays').update(stayUpdate).eq('id', stay.id);
     if (['incomplete', 'confirmed', 'requested', 'active'].includes(stay.status)) {
       await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', err.message));
     }
     await logSync({ stayId: stay.id, ghlAppointmentId: null, direction: 'ghl_to_db', action: 'contact_updated', payload: _flatContact });
+    syncedCount++;
   }
 
-  console.log(`Contact update for ${contactId}: synced ${stays.length} stay(s)`);
+  console.log(`Contact update for ${contactId}: synced ${syncedCount} of ${openStays.length} open stay(s)`);
 }
 
 async function logSync({ stayId, ghlAppointmentId, direction, action, payload, status = 'success', errorMessage = null }) {
@@ -738,7 +892,7 @@ async function processAppointment(payload, eventType) {
   if (existingStays && existingStays.length > 0) {
     const stay = existingStays[0];
     const contactLookup = (!stay.dog_name || !stay.kennel_type) ? await getContact(contactId).catch(() => null) : null;
-    const dogName = resolveDogName(_flatContact) || resolveDogName(contactLookup);
+    const dogName = resolveDogNameFromTitle(payload.title) || resolveDogName(_flatContact) || resolveDogName(contactLookup);
     const kennelCat = resolveKennelCategory(contactLookup, _flatContact);
 
     const updatePayload = {
@@ -767,8 +921,16 @@ async function processAppointment(payload, eventType) {
   const ownerPhone = prefilled?.phone || contact?.phone || null;
   const ownerEmail = prefilled?.email || contact?.email || null;
 
+  // Prefer the dog name straight off THIS webhook's flat payload —
+  // that's a snapshot of what was submitted for THIS specific
+  // appointment. Falling back to a live contact lookup is riskier for
+  // multi-dog households, since "Dog's Name" is a single field on the
+  // contact and can get overwritten by whichever booking the client
+  // submitted most recently.
+  const incomingDogName = resolveDogNameFromTitle(payload.title) || resolveDogName(_flatContact) || resolveDogName(contact);
+
   const pairableStay = await findPairableStay(
-    { contactId, phone: ownerPhone, email: ownerEmail },
+    { contactId, phone: ownerPhone, email: ownerEmail, dogName: incomingDogName },
     appointmentBookedAt,
     role,
     serviceType
@@ -790,7 +952,7 @@ async function processAppointment(payload, eventType) {
       owner_name:  pairableStay.owner_name  || prefilled?.name  || resolveOwnerName(contact),
       owner_email: pairableStay.owner_email || ownerEmail,
       owner_phone: pairableStay.owner_phone || ownerPhone,
-      dog_name:    pairableStay.dog_name    || resolveDogName(_flatContact) || resolveDogName(contact),
+      dog_name:    pairableStay.dog_name    || incomingDogName,
       ghl_date_added: pairableStay.ghl_date_added || appointmentBookedAt,
       ...(() => {
         const cat = resolveKennelCategory(contact, payload) ||
@@ -809,7 +971,7 @@ async function processAppointment(payload, eventType) {
       owner_name:   prefilled?.name  || resolveOwnerName(contact),
       owner_email:  ownerEmail,
       owner_phone:  ownerPhone,
-      dog_name:     resolveDogName(_flatContact) || resolveDogName(contact),
+      dog_name:     incomingDogName,
       source,
       service_type: serviceType,
       status: 'incomplete',
@@ -1019,6 +1181,7 @@ app.post('/webhook/ghl', async (req, res) => {
       endTime:    body.endTime    || body.end_time    || query.end_time    || query.endTime,
       status:     apptStatus,
       dateAdded:  body.dateAdded  || body.date_added  || body.createdAt || new Date().toISOString(),
+      title:      body.title || body.appointmentTitle || body.calendar?.title || null,
       _flatContact: body,
     };
 
@@ -1219,6 +1382,266 @@ app.post('/api/kennels/settings', async (req, res) => {
       removed: idsToRemove.length,
       blocked, // still above target — these kennels currently have active/upcoming stays
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------
+// PUBLIC MULTI-DOG BOARDING BOOKING ENDPOINT
+// Replaces the survey's single "name of all dogs" free-text field +
+// single calendar visit. The client submits ALL their dogs and one
+// shared drop-off/pick-up date range in ONE request; this endpoint
+// creates a real, separate GHL appointment pair per dog (with the
+// dog's name written directly into the title, not inferred) and
+// writes the matching boarding_stays row for each dog in the same
+// request — so there is no pairing ambiguity for these bookings at
+// all, unlike appointments that arrive via GHL's own calendar widget.
+//
+// Body: {
+//   firstName, lastName, email, phone,
+//   hasBoardedBefore: boolean,
+//   dogs: [{ name: string }],   // 1-3 dogs
+//   startDate: 'YYYY-MM-DD',    // shared drop-off date across all dogs
+//   endDate:   'YYYY-MM-DD',    // shared pick-up date across all dogs
+// }
+// ------------------------------------------------------------
+app.post('/api/bookings/boarding', async (req, res) => {
+  try {
+    const { firstName, lastName, email, phone, hasBoardedBefore, dogs, startDate, endDate } = req.body;
+
+    if (!email && !phone) return res.status(400).json({ error: 'Email or phone is required' });
+    if (!Array.isArray(dogs) || dogs.length === 0 || dogs.length > 3) {
+      return res.status(400).json({ error: 'Provide between 1 and 3 dogs' });
+    }
+    if (!startDate || !endDate) return res.status(400).json({ error: 'Drop-off and pick-up dates are required' });
+
+    const cleanDogs = dogs
+      .map(d => (typeof d === 'string'
+        ? { name: d, goodWithOtherDogs: null, kennelType: null, graduationStatus: null }
+        : { name: d?.name, goodWithOtherDogs: d?.goodWithOtherDogs ?? null, kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null }))
+      .map(d => ({ ...d, name: (d.name || '').trim() }))
+      .filter(d => d.name);
+    if (cleanDogs.length === 0) return res.status(400).json({ error: 'At least one dog name is required' });
+
+    const contact = await upsertContact({ email, phone, firstName, lastName });
+    if (!contact || !contact.id) throw new Error('Could not find or create GHL contact');
+    const contactId = contact.id;
+
+    const cals = CONFIG.CALENDARS.boarding;
+    const startIso = new Date(startDate + 'T09:00:00').toISOString();
+    const endIso   = new Date(endDate   + 'T09:00:00').toISOString();
+    const source = 'online';
+
+    // The self-reported "have you boarded before" answer is what
+    // actually drives this — per the existing GHL workflow, first-time
+    // clients' appointments go in as "new" so staff can vet them before
+    // confirming (their dog's temperament, etc.); returning clients go
+    // straight to "confirmed". This is a direct business rule from the
+    // survey answer, not a guess from booking history.
+    const isFirstTime = !hasBoardedBefore;
+    const ghlAppointmentStatus = isFirstTime ? 'new' : 'confirmed';
+    const status = isFirstTime ? 'requested' : 'confirmed';
+
+    const created = [];
+    const errors = [];
+
+    for (const dog of cleanDogs) {
+      const dogName = dog.name;
+      try {
+        const dropoff = await createAppointment({
+          calendarId: cals.DROPOFF_ONLINE,
+          contactId,
+          title: `${dogName} — Boarding Drop Off`,
+          startTime: startIso,
+          endTime: startIso,
+          appointmentStatus: ghlAppointmentStatus,
+        });
+        const pickup = await createAppointment({
+          calendarId: cals.PICKUP_ONLINE,
+          contactId,
+          title: `${dogName} — Boarding Pick Up`,
+          startTime: endIso,
+          endTime: endIso,
+          appointmentStatus: ghlAppointmentStatus,
+        });
+
+        const notesParts = [];
+        if (isFirstTime && dog.goodWithOtherDogs !== null && dog.goodWithOtherDogs !== undefined) {
+          notesParts.push(`Good with other dogs: ${dog.goodWithOtherDogs ? 'Yes' : 'No'}`);
+        }
+
+        const insertPayload = {
+          contact_id: contactId,
+          owner_name: [firstName, lastName].filter(Boolean).join(' ') || null,
+          owner_email: email || null,
+          owner_phone: phone || null,
+          dog_name: dogName,
+          source,
+          service_type: 'boarding',
+          status,
+          is_returning_client: !!hasBoardedBefore,
+          internal_notes: notesParts.join(' · ') || null,
+          last_modified_source: 'portal',
+          last_synced_at: new Date().toISOString(),
+          ghl_date_added: new Date().toISOString(),
+          ghl_dropoff_appointment_id: dropoff.id,
+          ghl_pickup_appointment_id: pickup.id,
+          dropoff_calendar_id: cals.DROPOFF_ONLINE,
+          pickup_calendar_id: cals.PICKUP_ONLINE,
+          start_date: startIso,
+          end_date: endIso,
+          // Returning clients tell us their dog's category right in
+          // this form, so we skip the "needs_size" flag entirely for
+          // them; first-timers still land as needs_size until staff
+          // set kennel_category (or _2/_3) on the contact after intake.
+          ...(dog.kennelType ? { kennel_type: dog.kennelType, graduation_status: dog.graduationStatus, kennel_status: 'unassigned' } : { kennel_status: 'needs_size' }),
+        };
+
+        const { data: newStay, error: insertErr } = await supabase
+          .from('boarding_stays')
+          .insert(insertPayload)
+          .select()
+          .single();
+        if (insertErr) throw insertErr;
+
+        const kennelResult = await assignKennelAndSave(newStay.id).catch(() => null);
+        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_multi_dog_booking', payload: { dogName, startDate, endDate }, status: 'success' });
+
+        created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
+      } catch (err) {
+        console.error(`Multi-dog booking failed for dog "${dogName}":`, err.message);
+        errors.push({ dogName, error: err.message });
+      }
+    }
+
+    res.json({ contactId, created, errors, success: errors.length === 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------
+// CONTACT SEARCH (staff-facing type-ahead)
+// ------------------------------------------------------------
+app.get('/api/contacts/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json([]);
+    const matches = await searchContacts(q);
+    res.json(matches);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------
+// INTERNAL (STAFF-FACING) MULTI-DOG BOOKING ENDPOINT
+// Same shape as /api/bookings/boarding, but for staff creating
+// bookings on a client's behalf from the portal — supports any
+// service type (using IN-PERSON calendars, since staff booked this
+// directly rather than the client booking online), staff already
+// knows the kennel type/graduation per dog (no "needs_size" flagging
+// unless staff deliberately leaves it blank), and always goes in as
+// "confirmed" since staff has already vetted the client.
+//
+// Body: {
+//   contactId?: string,                  // if selected from search
+//   firstName, lastName, email, phone,   // used if contactId not given (or to fill gaps)
+//   serviceType: 'boarding'|'basic'|'bundle'|'leash_free'|'service_dog'|'community',
+//   dogs: [{ name, kennelType?, graduationStatus? }],  // 1-3 dogs
+//   startDate, endDate,
+// }
+// ------------------------------------------------------------
+app.post('/api/bookings/internal', async (req, res) => {
+  try {
+    const { contactId: existingContactId, firstName, lastName, email, phone, serviceType, dogs, startDate, endDate } = req.body;
+
+    if (!CONFIG.CALENDARS[serviceType]) return res.status(400).json({ error: 'Unknown service type' });
+    if (!existingContactId && !email && !phone) return res.status(400).json({ error: 'Select a contact or provide an email/phone' });
+    if (!Array.isArray(dogs) || dogs.length === 0 || dogs.length > 3) {
+      return res.status(400).json({ error: 'Provide between 1 and 3 dogs' });
+    }
+    if (!startDate || !endDate) return res.status(400).json({ error: 'Drop-off and pick-up dates are required' });
+
+    const cleanDogs = dogs
+      .map(d => ({ name: (d?.name || '').trim(), kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null }))
+      .filter(d => d.name);
+    if (cleanDogs.length === 0) return res.status(400).json({ error: 'At least one dog name is required' });
+
+    const contactId = existingContactId || (await upsertContact({ email, phone, firstName, lastName }))?.id;
+    if (!contactId) throw new Error('Could not find or create GHL contact');
+
+    const cals = CONFIG.CALENDARS[serviceType];
+    if (!cals.DROPOFF_INPERSON || !cals.PICKUP_INPERSON) {
+      return res.status(400).json({ error: `No in-person calendars configured for ${serviceType}` });
+    }
+    const startIso = new Date(startDate + 'T09:00:00').toISOString();
+    const endIso   = new Date(endDate   + 'T09:00:00').toISOString();
+
+    const created = [];
+    const errors = [];
+
+    for (const dog of cleanDogs) {
+      const dogName = dog.name;
+      try {
+        const dropoff = await createAppointment({
+          calendarId: cals.DROPOFF_INPERSON,
+          contactId,
+          title: `${dogName} — ${serviceType === 'boarding' ? 'Boarding' : serviceType} Drop Off`,
+          startTime: startIso,
+          endTime: startIso,
+          appointmentStatus: 'confirmed',
+        });
+        const pickup = await createAppointment({
+          calendarId: cals.PICKUP_INPERSON,
+          contactId,
+          title: `${dogName} — ${serviceType === 'boarding' ? 'Boarding' : serviceType} Pick Up`,
+          startTime: endIso,
+          endTime: endIso,
+          appointmentStatus: 'confirmed',
+        });
+
+        const insertPayload = {
+          contact_id: contactId,
+          owner_name: [firstName, lastName].filter(Boolean).join(' ') || null,
+          owner_email: email || null,
+          owner_phone: phone || null,
+          dog_name: dogName,
+          source: 'internal',
+          service_type: serviceType,
+          status: 'confirmed',
+          is_returning_client: true,
+          last_modified_source: 'portal',
+          last_synced_at: new Date().toISOString(),
+          ghl_date_added: new Date().toISOString(),
+          ghl_dropoff_appointment_id: dropoff.id,
+          ghl_pickup_appointment_id: pickup.id,
+          dropoff_calendar_id: cals.DROPOFF_INPERSON,
+          pickup_calendar_id: cals.PICKUP_INPERSON,
+          start_date: startIso,
+          end_date: endIso,
+          ...(dog.kennelType ? { kennel_type: dog.kennelType, graduation_status: dog.graduationStatus, kennel_status: 'unassigned' } : { kennel_status: 'needs_size' }),
+        };
+
+        const { data: newStay, error: insertErr } = await supabase
+          .from('boarding_stays')
+          .insert(insertPayload)
+          .select()
+          .single();
+        if (insertErr) throw insertErr;
+
+        const kennelResult = await assignKennelAndSave(newStay.id).catch(() => null);
+        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_internal_booking', payload: { dogName, serviceType, startDate, endDate }, status: 'success' });
+
+        created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
+      } catch (err) {
+        console.error(`Internal booking failed for dog "${dogName}":`, err.message);
+        errors.push({ dogName, error: err.message });
+      }
+    }
+
+    res.json({ contactId, created, errors, success: errors.length === 0 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
