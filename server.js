@@ -85,18 +85,18 @@ const CONFIG = {
     },
     basic: {
       DROPOFF_INPERSON: '34JtodEqRp3K2wLp0a0y',   // Basic Drop Off
-      PICKUP_INPERSON:  'U53Ci7ndlS0NIkAa6vya',   // Basic Pick-up
+      PICKUP_INPERSON:  'U53Ci7ndlS0NlkAa6vya',   // Basic Pick-up
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
     },
     leash_free: {
       DROPOFF_INPERSON: 'MXqoZqw2t3ewo1Oxja2m',   // Leash Free Drop Off
-      PICKUP_INPERSON:  'QBN6Y6UGIgDufXHz6B2I',    // Leash Free Pick Up
+      PICKUP_INPERSON:  'QBN6Y6U6lgDufXHz6B2l',    // Leash Free Pick Up
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
     },
     service_dog: {
-      DROPOFF_INPERSON: 'U0sp9FfaU9qOiWp1Upb',     // Service Dog Drop Off
+      DROPOFF_INPERSON: 'U0sp9FfaU9qJOiWp1Upb',     // Service Dog Drop Off
       PICKUP_INPERSON:  '8rQdqxN39H6Db3Duf5ZX',    // Service Dog Pick-up
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
@@ -108,8 +108,8 @@ const CONFIG = {
       PICKUP_ONLINE:    null,
     },
     bundle: {
-      DROPOFF_INPERSON: 'ZqzoS3ckFZafZcaUKyOM',    // Bundle Drop Off
-      PICKUP_INPERSON:  '2sAl9Q61WM2WNTqLqcGj',    // Bundle Pick-up
+      DROPOFF_INPERSON: 'Zqzo53ckFZafZcaUKyOM',    // Bundle Drop Off
+      PICKUP_INPERSON:  '2sAT9Q61WM2WNTqLqcGj',    // Bundle Pick-up
       DROPOFF_ONLINE:   null,
       PICKUP_ONLINE:    null,
     },
@@ -342,10 +342,11 @@ async function getContactAppointments(contactId) {
   const searchStart = now.getTime() - 90 * 24 * 60 * 60 * 1000;
   const searchEnd = now.getTime() + 90 * 24 * 60 * 60 * 1000;
 
-  // GHL's /calendars/events endpoint appears to require calendarId —
-  // calling it without one is the most likely cause of a 422 on every
-  // single request regardless of contact (a missing/invalid required
-  // field, not bad data). Query once per known calendar instead.
+  // GHL rejects contactId as a query param on this endpoint when
+  // calendarId is also present ("property contactId should not
+  // exist") — confirmed from the actual response body. So: fetch all
+  // events per calendar in the date range, then filter to this
+  // contact ourselves from each event's own contactId field.
   const allEvents = [];
   for (const calendarId of allKnownCalendarIds()) {
     try {
@@ -353,17 +354,18 @@ async function getContactAppointments(contactId) {
         params: {
           locationId: CONFIG.GHL_LOCATION,
           calendarId,
-          contactId,
           startTime: searchStart,
           endTime: searchEnd,
         },
       });
       const events = res.data?.events || res.data?.appointments || [];
-      allEvents.push(...events);
+      const matching = events.filter(e => (e.contactId || e.contact_id) === contactId);
+      allEvents.push(...matching);
     } catch (err) {
-      // Log the REAL response body, not just the status code, so a
-      // recurring failure like this is diagnosable straight from the
-      // Render logs instead of needing a manual repro.
+      // "The calendar is not found" here means that specific
+      // calendarId is stale/wrong in CONFIG.CALENDARS — worth fixing
+      // in config, but we still want every OTHER calendar checked, so
+      // just log and move on rather than aborting the whole scan.
       console.error(`[getContactAppointments] calendarId=${calendarId} contactId=${contactId} failed:`, describeGhlError(err));
     }
   }
