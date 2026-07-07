@@ -17,6 +17,34 @@ const app = express();
 app.use(express.json());
 
 // ------------------------------------------------------------
+// AUTH LOCKOUT CONSTANTS
+// (previously referenced in /api/auth/login but never defined —
+// this is what was causing every failed PIN attempt to 500)
+// ------------------------------------------------------------
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_MINUTES = 15;
+
+// ------------------------------------------------------------
+// DATE RANGE / TIMEZONE HELPERS
+// (previously referenced by findAvailableKennel and the kennel/
+// dashboard routes but never defined — this is what was causing
+// "rangesOverlap is not defined" on every kennel assignment)
+// ------------------------------------------------------------
+const BUSINESS_TZ = 'America/New_York';
+
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  const aE = aEnd || '9999-12-31';
+  const bE = bEnd || '9999-12-31';
+  return aStart <= bE && bStart <= aE;
+}
+
+function getDateStringInTZ(date, tz) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || BUSINESS_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(date);
+}
+
+// ------------------------------------------------------------
 // CORS — allow the portal (hosted anywhere, including file://)
 // to call this API. Since this is an internal staff tool behind
 // PIN auth, we allow all origins rather than maintaining an
@@ -335,12 +363,6 @@ function resolveKennelType(contact, flatPayload) {
 }
 
 async function isReturningClient(contactId) {
-  const { data, error } = await supabase
-    .from('portal_users') // Changed target validation framework maps cleanly
-    .select('id')
-    .eq('id', contactId)
-    .limit(1);
-
   const { data: stays, error: sErr } = await supabase
     .from('boarding_stays')
     .select('id')
@@ -348,7 +370,7 @@ async function isReturningClient(contactId) {
     .in('status', ['completed', 'active', 'confirmed'])
     .limit(1);
 
-  if (sErr || error) return false;
+  if (sErr || !stays) return false;
   return stays.length > 0;
 }
 
@@ -600,9 +622,14 @@ async function getKennelOccupancySummary(dateStr) {
     s.kennel_status && s.kennel_status !== 'assigned'
   );
 
-  const summary = { large: { total: 0, filled: 0 }, medium: { total: 0, filled: 0 }, small: { total: 0, filled: 0 } };
+  const summary = {
+    special_needs: { total: 0, filled: 0 },
+    regular:       { total: 0, filled: 0 },
+    small:         { total: 0, filled: 0 },
+    overflow:      { total: 0, filled: 0 },
+  };
   kennels.forEach(k => {
-    if (!summary[k.type]) return;
+    if (!summary[k.type]) summary[k.type] = { total: 0, filled: 0 };
     summary[k.type].total++;
     if (byKennel[k.id]) summary[k.type].filled++;
   });
@@ -618,6 +645,47 @@ async function getKennelOccupancySummary(dateStr) {
       } : null,
     })),
     flagged,
+  };
+}
+
+// ------------------------------------------------------------
+// DASHBOARD BUILDER FOR A GIVEN DATE
+// (previously referenced by /api/dashboard/today but never
+// defined — this is what was causing that route to 500)
+// ------------------------------------------------------------
+async function buildDashboardForDate(dateStr) {
+  const target = dateStr || getDateStringInTZ(new Date());
+
+  const { data: stays, error } = await supabase.from('boarding_stays').select('*');
+  if (error) throw error;
+
+  const notCancelled = (stays || []).filter(s => s.status !== 'cancelled');
+  const arriving  = notCancelled.filter(s => s.start_date === target);
+  const departing = notCancelled.filter(s => s.end_date === target);
+  const active = notCancelled.filter(s => {
+    if (!s.start_date || s.start_date > target) return false;
+    if (!s.end_date) return true;
+    return s.end_date >= target;
+  });
+  const pending    = (stays || []).filter(s => s.status === 'requested');
+  const incomplete = (stays || []).filter(s => s.status === 'incomplete');
+
+  const kennelOccupancy = await getKennelOccupancySummary(target);
+
+  return {
+    date: target,
+    counts: {
+      arriving:  arriving.length,
+      departing: departing.length,
+      active:    active.length,
+      total:     (stays || []).length,
+      pending:   pending.length,
+      incomplete: incomplete.length,
+    },
+    arriving,
+    departing,
+    active,
+    kennelOccupancy,
   };
 }
 
@@ -832,7 +900,7 @@ async function autoHealTimelineQueue() {
         const apptTime = new Date(apptStartTime).getTime();
         const delta = Math.abs(apptTime - existingApptTime);
 
-        if (delta > CONFIG.MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
+        if (delta > MAX_STAY_DAYS * 24 * 3600 * 1000) return false;
         if (missingRole === 'pickup' && apptTime < existingApptTime) return false;
         if (missingRole === 'dropoff' && apptTime > existingApptTime) return false;
 
@@ -1067,6 +1135,95 @@ app.patch('/api/stays/:id/kennel', async (req, res) => {
   }
 });
 
+// ------------------------------------------------------------
+// KENNEL SETTINGS (counts per category)
+// Previously referenced by the frontend's "Kennel Settings" page
+// but no backend route existed for it at all.
+// ------------------------------------------------------------
+const KENNEL_SETTINGS_TYPES = ['special_needs', 'regular', 'small', 'overflow'];
+const KENNEL_LABEL_PREFIX = { special_needs: 'SN', regular: 'R', small: 'S', overflow: 'OF' };
+
+app.get('/api/kennels/settings', async (req, res) => {
+  try {
+    const kennels = await getAllKennels();
+    const counts = {};
+    KENNEL_SETTINGS_TYPES.forEach(t => { counts[t] = 0; });
+    kennels.forEach(k => { counts[k.type] = (counts[k.type] || 0) + 1; });
+    res.json({ counts });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// body: { type: 'special_needs'|'regular'|'small'|'overflow', target: <int> }
+app.post('/api/kennels/settings', async (req, res) => {
+  try {
+    const { type, target } = req.body;
+    if (!KENNEL_SETTINGS_TYPES.includes(type)) return res.status(400).json({ error: 'Invalid kennel type' });
+    const targetCount = parseInt(target, 10);
+    if (!Number.isFinite(targetCount) || targetCount < 0) return res.status(400).json({ error: 'Invalid target count' });
+
+    const kennels = (await getAllKennels()).filter(k => k.type === type);
+    const currentCount = kennels.length;
+
+    if (targetCount === currentCount) {
+      return res.json({ type, before: currentCount, after: currentCount, added: 0, removed: 0, blocked: 0 });
+    }
+
+    if (targetCount > currentCount) {
+      const toAdd = targetCount - currentCount;
+      const existingNums = kennels
+        .map(k => parseInt(String(k.label).replace(/\D/g, ''), 10))
+        .filter(n => Number.isFinite(n));
+      let nextNum = existingNums.length ? Math.max(...existingNums) + 1 : 1;
+
+      const inserts = [];
+      for (let i = 0; i < toAdd; i++) {
+        inserts.push({ label: `${KENNEL_LABEL_PREFIX[type]}-${String(nextNum).padStart(2, '0')}`, type, active: true });
+        nextNum++;
+      }
+      const { error } = await supabase.from('kennels').insert(inserts);
+      if (error) throw error;
+      return res.json({ type, before: currentCount, after: targetCount, added: toAdd, removed: 0, blocked: 0 });
+    }
+
+    // Shrinking: never remove a kennel with an active/upcoming stay.
+    const toRemove = currentCount - targetCount;
+    const today = getDateStringInTZ(new Date());
+
+    const { data: liveStays, error: sErr } = await supabase
+      .from('boarding_stays')
+      .select('kennel_id, end_date, status')
+      .not('kennel_id', 'is', null)
+      .not('status', 'in', '(cancelled,completed)');
+    if (sErr) throw sErr;
+
+    const occupiedKennelIds = new Set(
+      liveStays.filter(s => !s.end_date || s.end_date >= today).map(s => s.kennel_id)
+    );
+
+    const removable = kennels.filter(k => !occupiedKennelIds.has(k.id));
+    const idsToRemove = removable.slice(0, toRemove).map(k => k.id);
+    const blocked = toRemove - idsToRemove.length;
+
+    if (idsToRemove.length) {
+      const { error: dErr } = await supabase.from('kennels').delete().in('id', idsToRemove);
+      if (dErr) throw dErr;
+    }
+
+    res.json({
+      type,
+      before: currentCount,
+      after: currentCount - idsToRemove.length,
+      added: 0,
+      removed: idsToRemove.length,
+      blocked, // still above target — these kennels currently have active/upcoming stays
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/kennels/backfill', async (req, res) => {
   try {
     const { data: stays, error } = await supabase
@@ -1115,11 +1272,12 @@ app.get('/api/dashboard/reporting', async (req, res) => {
     };
 
     const kennelBreakdown = {
-      large:      data.filter(s => s.kennel_type === 'large'  && s.kennel_status === 'assigned').length,
-      medium:     data.filter(s => s.kennel_type === 'medium' && s.kennel_status === 'assigned').length,
-      small:      data.filter(s => s.kennel_type === 'small'  && s.kennel_status === 'assigned').length,
-      unassigned: data.filter(s => s.kennel_status === 'unassigned').length,
-      needsSize:  data.filter(s => s.kennel_status === 'needs_size').length,
+      special_needs: data.filter(s => s.kennel_type === 'special_needs' && s.kennel_status === 'assigned').length,
+      regular:       data.filter(s => s.kennel_type === 'regular'       && s.kennel_status === 'assigned').length,
+      small:         data.filter(s => s.kennel_type === 'small'         && s.kennel_status === 'assigned').length,
+      overflow:      data.filter(s => s.kennel_type === 'overflow'      && s.kennel_status === 'assigned').length,
+      unassigned:    data.filter(s => s.kennel_status === 'unassigned').length,
+      needsSize:     data.filter(s => s.kennel_status === 'needs_size').length,
     };
 
     const kennelOccupancy = await getKennelOccupancySummary(getDateStringInTZ(new Date()));
