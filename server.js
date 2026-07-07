@@ -237,6 +237,37 @@ async function updateAppointment(appointmentId, payload) {
 // Creates a real GHL appointment directly — used by the multi-dog
 // booking endpoint so the dog's name is set with certainty at
 // creation time, instead of being inferred later from a webhook.
+// Real availability for a calendar on a given day — respects the
+// calendar's configured hours, slot duration, and existing bookings.
+// Used so booking pages only ever offer times GHL would actually
+// accept, instead of a free-text time picker.
+async function getFreeSlots(calendarId, dateStr, timezone) {
+  const dayStart = new Date(dateStr + 'T00:00:00').getTime();
+  const dayEnd   = new Date(dateStr + 'T23:59:59').getTime();
+  const res = await ghl.get(`/calendars/${calendarId}/free-slots`, {
+    params: { startDate: dayStart, endDate: dayEnd, timezone: timezone || BUSINESS_TZ },
+  });
+  const data = res.data || {};
+  // GHL's response shape has varied across versions — normalize
+  // whatever comes back into a flat array of ISO datetime strings.
+  let slots = [];
+  if (Array.isArray(data[dateStr]?.slots)) {
+    slots = data[dateStr].slots;
+  } else if (Array.isArray(data.slots)) {
+    slots = data.slots;
+  } else {
+    Object.values(data).forEach(v => { if (v && Array.isArray(v.slots)) slots.push(...v.slots); });
+  }
+  return slots;
+}
+
+function calendarIdFor(serviceType, leg, mode) {
+  const cals = CONFIG.CALENDARS[serviceType];
+  if (!cals) return null;
+  if (mode === 'internal') return leg === 'dropoff' ? cals.DROPOFF_INPERSON : cals.PICKUP_INPERSON;
+  return leg === 'dropoff' ? cals.DROPOFF_ONLINE : cals.PICKUP_ONLINE;
+}
+
 async function createAppointment({ calendarId, contactId, title, startTime, endTime, appointmentStatus }) {
   const res = await ghl.post('/calendars/events/appointments', {
     calendarId,
@@ -1402,19 +1433,25 @@ app.post('/api/kennels/settings', async (req, res) => {
 //   firstName, lastName, email, phone,
 //   hasBoardedBefore: boolean,
 //   dogs: [{ name: string }],   // 1-3 dogs
-//   startDate: 'YYYY-MM-DD',    // shared drop-off date across all dogs
-//   endDate:   'YYYY-MM-DD',    // shared pick-up date across all dogs
+//   dropoffDateTime, pickupDateTime: full ISO datetimes from a real available slot
 // }
 // ------------------------------------------------------------
 app.post('/api/bookings/boarding', async (req, res) => {
   try {
-    const { firstName, lastName, email, phone, hasBoardedBefore, dogs, startDate, endDate } = req.body;
+    const { firstName, lastName, email, phone, hasBoardedBefore, dogs, dropoffDateTime, pickupDateTime } = req.body;
 
     if (!email && !phone) return res.status(400).json({ error: 'Email or phone is required' });
     if (!Array.isArray(dogs) || dogs.length === 0 || dogs.length > 3) {
       return res.status(400).json({ error: 'Provide between 1 and 3 dogs' });
     }
-    if (!startDate || !endDate) return res.status(400).json({ error: 'Drop-off and pick-up dates are required' });
+    if (!dropoffDateTime || !pickupDateTime) {
+      return res.status(400).json({ error: 'Select an available drop-off and pick-up time' });
+    }
+    const startIso = new Date(dropoffDateTime).toISOString();
+    const endIso   = new Date(pickupDateTime).toISOString();
+    if (new Date(endIso) < new Date(startIso)) {
+      return res.status(400).json({ error: 'Pick-up time must be on or after the drop-off time' });
+    }
 
     const cleanDogs = dogs
       .map(d => (typeof d === 'string'
@@ -1429,8 +1466,6 @@ app.post('/api/bookings/boarding', async (req, res) => {
     const contactId = contact.id;
 
     const cals = CONFIG.CALENDARS.boarding;
-    const startIso = new Date(startDate + 'T09:00:00').toISOString();
-    const endIso   = new Date(endDate   + 'T09:00:00').toISOString();
     const source = 'online';
 
     // The self-reported "have you boarded before" answer is what
@@ -1506,7 +1541,7 @@ app.post('/api/bookings/boarding', async (req, res) => {
         if (insertErr) throw insertErr;
 
         const kennelResult = await assignKennelAndSave(newStay.id).catch(() => null);
-        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_multi_dog_booking', payload: { dogName, startDate, endDate }, status: 'success' });
+        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_multi_dog_booking', payload: { dogName, dropoffDateTime: startIso, pickupDateTime: endIso }, status: 'success' });
 
         created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
       } catch (err) {
@@ -1516,6 +1551,28 @@ app.post('/api/bookings/boarding', async (req, res) => {
     }
 
     res.json({ contactId, created, errors, success: errors.length === 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------------------------
+// AVAILABLE BOOKING SLOTS (real GHL availability, not free-text)
+// ?service=boarding&leg=dropoff|pickup&date=YYYY-MM-DD&mode=online|internal
+// ------------------------------------------------------------
+app.get('/api/booking-slots', async (req, res) => {
+  try {
+    const { service, leg, date, mode } = req.query;
+    if (!service || !leg || !date) return res.status(400).json({ error: 'service, leg, and date are required' });
+    if (!['dropoff', 'pickup'].includes(leg)) return res.status(400).json({ error: 'leg must be dropoff or pickup' });
+
+    const calendarId = calendarIdFor(service, leg, mode === 'internal' ? 'internal' : 'online');
+    if (!calendarId) {
+      return res.status(400).json({ error: `No ${mode === 'internal' ? 'in-person' : 'online'} calendar configured for ${service} ${leg}` });
+    }
+
+    const slots = await getFreeSlots(calendarId, date, BUSINESS_TZ);
+    res.json({ date, slots });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1550,19 +1607,21 @@ app.get('/api/contacts/search', async (req, res) => {
 //   firstName, lastName, email, phone,   // used if contactId not given (or to fill gaps)
 //   serviceType: 'boarding'|'basic'|'bundle'|'leash_free'|'service_dog'|'community',
 //   dogs: [{ name, kennelType?, graduationStatus? }],  // 1-3 dogs
-//   startDate, endDate,
+//   dropoffDateTime, pickupDateTime,
 // }
 // ------------------------------------------------------------
 app.post('/api/bookings/internal', async (req, res) => {
   try {
-    const { contactId: existingContactId, firstName, lastName, email, phone, serviceType, dogs, startDate, endDate } = req.body;
+    const { contactId: existingContactId, firstName, lastName, email, phone, serviceType, dogs, dropoffDateTime, pickupDateTime } = req.body;
 
     if (!CONFIG.CALENDARS[serviceType]) return res.status(400).json({ error: 'Unknown service type' });
     if (!existingContactId && !email && !phone) return res.status(400).json({ error: 'Select a contact or provide an email/phone' });
     if (!Array.isArray(dogs) || dogs.length === 0 || dogs.length > 3) {
       return res.status(400).json({ error: 'Provide between 1 and 3 dogs' });
     }
-    if (!startDate || !endDate) return res.status(400).json({ error: 'Drop-off and pick-up dates are required' });
+    if (!dropoffDateTime || !pickupDateTime) {
+      return res.status(400).json({ error: 'Select an available drop-off and pick-up time' });
+    }
 
     const cleanDogs = dogs
       .map(d => ({ name: (d?.name || '').trim(), kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null }))
@@ -1576,8 +1635,11 @@ app.post('/api/bookings/internal', async (req, res) => {
     if (!cals.DROPOFF_INPERSON || !cals.PICKUP_INPERSON) {
       return res.status(400).json({ error: `No in-person calendars configured for ${serviceType}` });
     }
-    const startIso = new Date(startDate + 'T09:00:00').toISOString();
-    const endIso   = new Date(endDate   + 'T09:00:00').toISOString();
+    const startIso = new Date(dropoffDateTime).toISOString();
+    const endIso   = new Date(pickupDateTime).toISOString();
+    if (new Date(endIso) < new Date(startIso)) {
+      return res.status(400).json({ error: 'Pick-up time must be on or after the drop-off time' });
+    }
 
     const created = [];
     const errors = [];
@@ -1632,7 +1694,7 @@ app.post('/api/bookings/internal', async (req, res) => {
         if (insertErr) throw insertErr;
 
         const kennelResult = await assignKennelAndSave(newStay.id).catch(() => null);
-        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_internal_booking', payload: { dogName, serviceType, startDate, endDate }, status: 'success' });
+        await logSync({ stayId: newStay.id, ghlAppointmentId: dropoff.id, direction: 'db_to_ghl', action: 'created_via_internal_booking', payload: { dogName, serviceType, dropoffDateTime: startIso, pickupDateTime: endIso }, status: 'success' });
 
         created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
       } catch (err) {
