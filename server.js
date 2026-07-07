@@ -312,13 +312,54 @@ async function searchContacts(query) {
   }));
 }
 
+// Every calendar ID we know about, across every service type — used
+// to scan for a contact's appointments without needing to guess which
+// specific calendar they're on.
+function allKnownCalendarIds() {
+  const ids = [];
+  Object.values(CONFIG.CALENDARS).forEach(cals => {
+    ['DROPOFF_INPERSON', 'DROPOFF_ONLINE', 'PICKUP_INPERSON', 'PICKUP_ONLINE'].forEach(key => {
+      if (cals[key]) ids.push(cals[key]);
+    });
+  });
+  return ids;
+}
+
 async function getContactAppointments(contactId) {
   if (!contactId || contactId === 'LIVE_WEBHOOK_MATCH' || contactId === 'PENDING_POST_SYNC') return [];
   const now = new Date();
   const searchStart = now.getTime() - 90 * 24 * 60 * 60 * 1000;
   const searchEnd = now.getTime() + 90 * 24 * 60 * 60 * 1000;
-  const res = await ghl.get(`/calendars/events?locationId=${CONFIG.GHL_LOCATION}&contactId=${contactId}&startTime=${searchStart}&endTime=${searchEnd}`);
-  return res.data?.events || res.data?.appointments || [];
+
+  // GHL's /calendars/events endpoint appears to require calendarId —
+  // calling it without one is the most likely cause of a 422 on every
+  // single request regardless of contact (a missing/invalid required
+  // field, not bad data). Query once per known calendar instead.
+  const allEvents = [];
+  for (const calendarId of allKnownCalendarIds()) {
+    try {
+      const res = await ghl.get('/calendars/events', {
+        params: {
+          locationId: CONFIG.GHL_LOCATION,
+          calendarId,
+          contactId,
+          startTime: searchStart,
+          endTime: searchEnd,
+        },
+      });
+      const events = res.data?.events || res.data?.appointments || [];
+      allEvents.push(...events);
+    } catch (err) {
+      // Log the REAL response body, not just the status code, so a
+      // recurring failure like this is diagnosable straight from the
+      // Render logs instead of needing a manual repro.
+      console.error(
+        `[getContactAppointments] calendarId=${calendarId} contactId=${contactId} failed:`,
+        err.response?.status, JSON.stringify(err.response?.data || err.message)
+      );
+    }
+  }
+  return allEvents;
 }
 
 // ------------------------------------------------------------
@@ -1124,7 +1165,7 @@ async function autoHealTimelineQueue() {
       }
     }
   } catch (err) {
-    console.error('[Timeline Healer Error]:', err.message);
+    console.error('[Timeline Healer Error]:', err.response?.status, JSON.stringify(err.response?.data || err.message));
   }
 }
 
