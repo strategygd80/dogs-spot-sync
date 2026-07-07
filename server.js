@@ -224,6 +224,17 @@ const ghl = axios.create({
   },
 });
 
+// axios's default err.message is just "Request failed with status code
+// 422" — completely useless for figuring out WHY. GHL's actual reason
+// lives in err.response.data. Use this everywhere a GHL call is
+// caught, so failures are diagnosable straight from the logs.
+function describeGhlError(err) {
+  if (err.response) {
+    return `${err.response.status} ${JSON.stringify(err.response.data)}`;
+  }
+  return err.message;
+}
+
 async function getAppointment(appointmentId) {
   const res = await ghl.get(`/calendars/events/appointments/${appointmentId}`);
   return res.data;
@@ -353,10 +364,7 @@ async function getContactAppointments(contactId) {
       // Log the REAL response body, not just the status code, so a
       // recurring failure like this is diagnosable straight from the
       // Render logs instead of needing a manual repro.
-      console.error(
-        `[getContactAppointments] calendarId=${calendarId} contactId=${contactId} failed:`,
-        err.response?.status, JSON.stringify(err.response?.data || err.message)
-      );
+      console.error(`[getContactAppointments] calendarId=${calendarId} contactId=${contactId} failed:`, describeGhlError(err));
     }
   }
   return allEvents;
@@ -734,7 +742,7 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
 
     await supabase.from('boarding_stays').update(stayUpdate).eq('id', stay.id);
     if (['incomplete', 'confirmed', 'requested', 'active'].includes(stay.status)) {
-      await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', err.message));
+      await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     }
     await logSync({ stayId: stay.id, ghlAppointmentId: null, direction: 'ghl_to_db', action: 'contact_updated', payload: _flatContact });
     syncedCount++;
@@ -982,7 +990,7 @@ async function processAppointment(payload, eventType) {
     if (ghlStatus === 'cancelled') updatePayload.status = 'cancelled';
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
-    if (updatePayload.status !== 'cancelled') await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', err.message));
+    if (updatePayload.status !== 'cancelled') await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     await logSync({ stayId: stay.id, ghlAppointmentId, direction: 'ghl_to_db', action: eventType === 'AppointmentCreate' ? 'created' : 'updated', payload });
     console.log(`Updated stay ${stay.id} from GHL (${role})`);
     return;
@@ -1034,7 +1042,7 @@ async function processAppointment(payload, eventType) {
     };
 
     await supabase.from('boarding_stays').update(updatePayload).eq('id', pairableStay.id);
-    await assignKennelAndSave(pairableStay.id).catch(err => console.error('Kennel assignment error:', err.message));
+    await assignKennelAndSave(pairableStay.id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     await logSync({ stayId: pairableStay.id, ghlAppointmentId, direction: 'ghl_to_db', action: 'paired', payload });
     console.log(`Paired ${role} appointment into stay ${pairableStay.id}`);
   } else {
@@ -1068,7 +1076,7 @@ async function processAppointment(payload, eventType) {
 
     if (error) throw error;
 
-    await assignKennelAndSave(newStay.id).catch(err => console.error('Kennel assignment error:', err.message));
+    await assignKennelAndSave(newStay.id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     await logSync({ stayId: newStay.id, ghlAppointmentId, direction: 'ghl_to_db', action: 'created', payload });
     console.log(`Created incomplete stay ${newStay.id} waiting for ${role === 'dropoff' ? 'pickup' : 'dropoff'}`);
   }
@@ -1165,7 +1173,7 @@ async function autoHealTimelineQueue() {
       }
     }
   } catch (err) {
-    console.error('[Timeline Healer Error]:', err.response?.status, JSON.stringify(err.response?.data || err.message));
+    console.error('[Timeline Healer Error]:', describeGhlError(err));
   }
 }
 
@@ -1201,7 +1209,7 @@ app.post('/webhook/ghl', async (req, res) => {
     try {
       await processContactUpdate({ contactId, phone, email, ownerName, _flatContact: body });
     } catch (err) {
-      console.error('Webhook processing error for ContactUpdate:', err.message);
+      console.error('Webhook processing error for ContactUpdate:', describeGhlError(err));
       await logSync({
         ghlAppointmentId: null,
         direction: 'ghl_to_db',
@@ -1267,7 +1275,7 @@ app.post('/webhook/ghl', async (req, res) => {
       await processCancellation(payload);
     }
   } catch (err) {
-    console.error(`Webhook processing error for ${type}:`, err.message);
+    console.error(`Webhook processing error for ${type}:`, describeGhlError(err));
     await logSync({
       ghlAppointmentId: payload?.id,
       direction: 'ghl_to_db',
@@ -1530,7 +1538,7 @@ app.post('/api/bookings/boarding', async (req, res) => {
           contactId,
           title: `${dogName} — Boarding Drop Off`,
           startTime: startIso,
-          endTime: startIso,
+          endTime: new Date(new Date(startIso).getTime() + 10 * 60000).toISOString(),
           appointmentStatus: ghlAppointmentStatus,
         });
         const pickup = await createAppointment({
@@ -1538,7 +1546,7 @@ app.post('/api/bookings/boarding', async (req, res) => {
           contactId,
           title: `${dogName} — Boarding Pick Up`,
           startTime: endIso,
-          endTime: endIso,
+          endTime: new Date(new Date(endIso).getTime() + 10 * 60000).toISOString(),
           appointmentStatus: ghlAppointmentStatus,
         });
 
@@ -1586,8 +1594,8 @@ app.post('/api/bookings/boarding', async (req, res) => {
 
         created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
       } catch (err) {
-        console.error(`Multi-dog booking failed for dog "${dogName}":`, err.message);
-        errors.push({ dogName, error: err.message });
+        console.error(`Multi-dog booking failed for dog "${dogName}":`, describeGhlError(err));
+        errors.push({ dogName, error: describeGhlError(err) });
       }
     }
 
@@ -1693,7 +1701,7 @@ app.post('/api/bookings/internal', async (req, res) => {
           contactId,
           title: `${dogName} — ${serviceType === 'boarding' ? 'Boarding' : serviceType} Drop Off`,
           startTime: startIso,
-          endTime: startIso,
+          endTime: new Date(new Date(startIso).getTime() + 10 * 60000).toISOString(),
           appointmentStatus: 'confirmed',
         });
         const pickup = await createAppointment({
@@ -1701,7 +1709,7 @@ app.post('/api/bookings/internal', async (req, res) => {
           contactId,
           title: `${dogName} — ${serviceType === 'boarding' ? 'Boarding' : serviceType} Pick Up`,
           startTime: endIso,
-          endTime: endIso,
+          endTime: new Date(new Date(endIso).getTime() + 10 * 60000).toISOString(),
           appointmentStatus: 'confirmed',
         });
 
@@ -1739,8 +1747,8 @@ app.post('/api/bookings/internal', async (req, res) => {
 
         created.push({ dogName, stayId: newStay.id, kennelStatus: kennelResult?.kennel_status || 'needs_size' });
       } catch (err) {
-        console.error(`Internal booking failed for dog "${dogName}":`, err.message);
-        errors.push({ dogName, error: err.message });
+        console.error(`Internal booking failed for dog "${dogName}":`, describeGhlError(err));
+        errors.push({ dogName, error: describeGhlError(err) });
       }
     }
 
@@ -1869,7 +1877,7 @@ app.patch('/api/stays/:id/reschedule', async (req, res) => {
     if (end_date)   dbUpdate.end_date   = end_date;
 
     await supabase.from('boarding_stays').update(dbUpdate).eq('id', id);
-    await assignKennelAndSave(id).catch(err => console.error('Kennel assignment error:', err.message));
+    await assignKennelAndSave(id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     await logSync({ stayId: id, direction: 'db_to_ghl', action: 'rescheduled', payload: req.body, status: 'success' });
     res.json({ success: true });
   } catch (err) {
