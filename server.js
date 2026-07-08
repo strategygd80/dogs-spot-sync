@@ -1347,7 +1347,7 @@ app.get('/api/kennels/occupancy', async (req, res) => {
 app.patch('/api/stays/:id/kennel', async (req, res) => {
   try {
     const { id } = req.params;
-    const { kennel_id } = req.body;
+    const { kennel_id, graduation_status } = req.body;
     const { data: stay, error } = await supabase.from('boarding_stays').select('*').eq('id', id).single();
     if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
 
@@ -1362,12 +1362,14 @@ app.patch('/api/stays/:id/kennel', async (req, res) => {
 
       await supabase.from('boarding_stays').update({
         kennel_id, kennel_type: kennel.type, kennel_status: 'assigned',
+        graduation_status: graduation_status !== undefined ? graduation_status : stay.graduation_status,
         last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
       }).eq('id', id);
     } else {
       await supabase.from('boarding_stays').update({
         kennel_id: null,
         kennel_status: stay.kennel_type ? 'unassigned' : 'needs_size',
+        graduation_status: graduation_status !== undefined ? graduation_status : stay.graduation_status,
         last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
       }).eq('id', id);
     }
