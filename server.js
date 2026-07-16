@@ -245,6 +245,20 @@ async function updateAppointment(appointmentId, payload) {
   return res.data;
 }
 
+// For data-only corrections (e.g. fixing a dog's name in the title
+// after a typo, or a kennel category correction) — NOT a real status
+// change, so we don't want this to re-trigger GHL's confirmation/
+// notification workflows the way a normal reschedule or status change
+// would. `toNotify: false` is GHL's documented flag for suppressing
+// notification-triggering side effects on an update; I haven't been
+// able to confirm this against a live sandbox, so if a "quiet" data
+// correction still triggers a client-facing message, check the exact
+// field name GHL expects here first.
+async function updateAppointmentQuietly(appointmentId, payload) {
+  const res = await ghl.put(`/calendars/events/appointments/${appointmentId}`, { ...payload, toNotify: false });
+  return res.data;
+}
+
 // Creates a real GHL appointment directly — used by the multi-dog
 // booking endpoint so the dog's name is set with certainty at
 // creation time, instead of being inferred later from a webhook.
@@ -683,6 +697,42 @@ function resolvePerDogKennelCategory(flatPayload, dogIndex) {
   return parseKennelCategoryText(raw);
 }
 
+// Per-dog NAME fields on the contact — mirrors the kennel category
+// pattern above. Hedges across a few likely key spellings since the
+// exact custom field key wasn't confirmed; if none of these match
+// what's actually configured in GHL, dog names will keep silently
+// failing to resolve exactly like they were before this fix.
+const PER_DOG_NAME_KEYS = [
+  ['dog_1_name', 'dog1_name', 'Dog 1 Name', "Dog's Name"],
+  ['dog_2_name', 'dog2_name', 'Dog 2 Name'],
+  ['dog_3_name', 'dog3_name', 'Dog 3 Name'],
+];
+
+function resolvePerDogName(flatPayload, dogIndex) {
+  return getCustomFieldValue(flatPayload, null, PER_DOG_NAME_KEYS[dogIndex]);
+}
+
+// Returns every dog slot (0-2) that has a name on file for this
+// contact, each with its known kennel category if one's been set.
+// Used to let clients/staff PICK a known dog by name instead of
+// retyping it — removes both the typo risk and the ambiguity of
+// guessing which physical dog a booking belongs to.
+function getKnownDogsForContact(contact) {
+  const dogs = [];
+  for (let i = 0; i < PER_DOG_NAME_KEYS.length; i++) {
+    const name = resolvePerDogName(contact, i);
+    if (!name) continue;
+    const cat = resolvePerDogKennelCategory(contact, i);
+    dogs.push({
+      index: i,
+      name,
+      kennelType: cat?.kennel_type || null,
+      graduationStatus: cat?.kennel_grad_status || null,
+    });
+  }
+  return dogs;
+}
+
 async function processContactUpdate({ contactId, phone, email, ownerName, _flatContact }) {
   const dogName = resolveDogName(_flatContact);
 
@@ -717,7 +767,8 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
     if (openStays.length === 1) {
       // Only one dog on this contact — no ambiguity, accept either the
       // dog-1 slot or the single legacy "Dog's Name"/"Kennel Category" field.
-      if (dogName && !stay.dog_name) stayUpdate.dog_name = dogName;
+      const resolvedName = resolvePerDogName(_flatContact, 0) || dogName;
+      if (resolvedName && resolvedName !== stay.dog_name) stayUpdate.dog_name = resolvedName;
       const cat = resolvePerDogKennelCategory(_flatContact, 0) || resolveKennelCategory(null, _flatContact);
       if (cat) {
         stayUpdate.kennel_type       = cat.kennel_type;
@@ -726,8 +777,11 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
         stayUpdate.kennel_status     = 'unassigned';
       }
     } else {
-      // Multiple dogs on this contact — only apply the category field
-      // that matches THIS dog's position, never all three at once.
+      // Multiple dogs on this contact — only apply the name and
+      // category field that match THIS dog's position, never all
+      // three at once.
+      const resolvedName = resolvePerDogName(_flatContact, i);
+      if (resolvedName && resolvedName !== stay.dog_name) stayUpdate.dog_name = resolvedName;
       const cat = resolvePerDogKennelCategory(_flatContact, i);
       if (cat) {
         stayUpdate.kennel_type       = cat.kennel_type;
@@ -743,6 +797,25 @@ async function processContactUpdate({ contactId, phone, email, ownerName, _flatC
     stayUpdate.last_synced_at = new Date().toISOString();
 
     await supabase.from('boarding_stays').update(stayUpdate).eq('id', stay.id);
+
+    // If the dog's name changed, push the corrected title to whichever
+    // GHL appointments already exist for THIS specific dog's stay —
+    // matched by the exact appointment IDs stored on this stay row,
+    // never a broader lookup. Quiet update: this is a data correction,
+    // not a real reschedule/status change, so it shouldn't re-trigger
+    // confirmation emails or other notification workflows.
+    if (stayUpdate.dog_name) {
+      const svcLabel = stay.service_type === 'boarding' ? 'Boarding' : stay.service_type;
+      const titleUpdates = [];
+      if (stay.ghl_dropoff_appointment_id) {
+        titleUpdates.push(updateAppointmentQuietly(stay.ghl_dropoff_appointment_id, { title: `${stayUpdate.dog_name} — ${svcLabel} Drop Off` }));
+      }
+      if (stay.ghl_pickup_appointment_id) {
+        titleUpdates.push(updateAppointmentQuietly(stay.ghl_pickup_appointment_id, { title: `${stayUpdate.dog_name} — ${svcLabel} Pick Up` }));
+      }
+      await Promise.all(titleUpdates).catch(err => console.error(`Quiet title update failed for stay ${stay.id}:`, describeGhlError(err)));
+    }
+
     if (['incomplete', 'confirmed', 'requested', 'active'].includes(stay.status)) {
       await assignKennelAndSave(stay.id).catch(err => console.error('Kennel assignment error:', describeGhlError(err)));
     }
@@ -1009,7 +1082,26 @@ async function processAppointment(payload, eventType) {
   // multi-dog households, since "Dog's Name" is a single field on the
   // contact and can get overwritten by whichever booking the client
   // submitted most recently.
-  const incomingDogName = resolveDogNameFromTitle(payload.title) || resolveDogName(_flatContact) || resolveDogName(contact);
+  //
+  // If this contact already has other OPEN stays (e.g. this is dog 2
+  // or dog 3's dropoff arriving), use that count as a position index
+  // into the per-dog name fields (dog_1_name/dog_2_name/dog_3_name) —
+  // same creation-order trick used for kennel category. This covers
+  // the case where staff fill in all three dog-name fields on the
+  // contact BEFORE booking the appointments, so there's no later
+  // contact-update webhook to catch it retroactively.
+  const existingOpenStaysForContact = contactId && contactId !== 'LIVE_WEBHOOK_MATCH'
+    ? await findStaysForContact({ contactId, phone: prefilled?.phone, email: prefilled?.email })
+        .then(list => list.filter(s => !['cancelled', 'completed'].includes(s.status)))
+    : [];
+  const dogPositionIndex = Math.min(existingOpenStaysForContact.length, PER_DOG_NAME_KEYS.length - 1);
+
+  const incomingDogName =
+    resolveDogNameFromTitle(payload.title) ||
+    resolvePerDogName(_flatContact, dogPositionIndex) ||
+    resolveDogName(_flatContact) ||
+    resolvePerDogName(contact, dogPositionIndex) ||
+    resolveDogName(contact);
 
   const pairableStay = await findPairableStay(
     { contactId, phone: ownerPhone, email: ownerEmail, dogName: incomingDogName },
@@ -1508,8 +1600,8 @@ app.post('/api/bookings/boarding', async (req, res) => {
 
     const cleanDogs = dogs
       .map(d => (typeof d === 'string'
-        ? { name: d, goodWithOtherDogs: null, kennelType: null, graduationStatus: null }
-        : { name: d?.name, goodWithOtherDogs: d?.goodWithOtherDogs ?? null, kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null }))
+        ? { name: d, goodWithOtherDogs: null, kennelType: null, graduationStatus: null, dogIndex: null }
+        : { name: d?.name, goodWithOtherDogs: d?.goodWithOtherDogs ?? null, kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null, dogIndex: Number.isInteger(d?.dogIndex) ? d.dogIndex : null }))
       .map(d => ({ ...d, name: (d.name || '').trim() }))
       .filter(d => d.name);
     if (cleanDogs.length === 0) return res.status(400).json({ error: 'At least one dog name is required' });
@@ -1517,6 +1609,20 @@ app.post('/api/bookings/boarding', async (req, res) => {
     const contact = await upsertContact({ email, phone, firstName, lastName });
     if (!contact || !contact.id) throw new Error('Could not find or create GHL contact');
     const contactId = contact.id;
+
+    // If the client picked a known dog by name (dogIndex present) and
+    // didn't already choose a boarding type in the form, resolve the
+    // kennel category directly from that dog's own contact field —
+    // no guessing required, we know exactly which dog this is.
+    cleanDogs.forEach(dog => {
+      if (dog.dogIndex !== null && !dog.kennelType) {
+        const cat = resolvePerDogKennelCategory(contact, dog.dogIndex);
+        if (cat) {
+          dog.kennelType = cat.kennel_type;
+          dog.graduationStatus = cat.kennel_grad_status;
+        }
+      }
+    });
 
     const cals = CONFIG.CALENDARS.boarding;
     const source = 'online';
@@ -1645,6 +1751,43 @@ app.get('/api/contacts/search', async (req, res) => {
   }
 });
 
+// Known dog roster for a contact we already have the ID for (staff
+// portal, after picking a contact from search).
+app.get('/api/contacts/:contactId/dogs', async (req, res) => {
+  try {
+    const contact = await getContact(req.params.contactId);
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+    res.json({ contactId: req.params.contactId, dogs: getKnownDogsForContact(contact) });
+  } catch (err) {
+    res.status(500).json({ error: describeGhlError(err) });
+  }
+});
+
+// Same, but for the PUBLIC booking page, which only has email/phone
+// at this point (no contactId yet) — exact-match lookup only, never
+// creates a contact. If nothing matches, dogs comes back empty and
+// the client just gets the normal free-text new-dog flow.
+app.get('/api/contacts/lookup', async (req, res) => {
+  try {
+    const email = (req.query.email || '').trim().toLowerCase();
+    const phone = (req.query.phone || '').trim();
+    if (!email && !phone) return res.json({ contactId: null, dogs: [] });
+
+    const normPhone = normalizePhone(phone);
+    const candidates = await searchContacts(email || phone);
+    const match = candidates.find(c =>
+      (email && c.email && c.email.trim().toLowerCase() === email) ||
+      (normPhone && normalizePhone(c.phone) === normPhone)
+    );
+    if (!match) return res.json({ contactId: null, dogs: [] });
+
+    const contact = await getContact(match.id);
+    res.json({ contactId: match.id, dogs: contact ? getKnownDogsForContact(contact) : [] });
+  } catch (err) {
+    res.status(500).json({ error: describeGhlError(err) });
+  }
+});
+
 // ------------------------------------------------------------
 // INTERNAL (STAFF-FACING) MULTI-DOG BOOKING ENDPOINT
 // Same shape as /api/bookings/boarding, but for staff creating
@@ -1677,12 +1820,30 @@ app.post('/api/bookings/internal', async (req, res) => {
     }
 
     const cleanDogs = dogs
-      .map(d => ({ name: (d?.name || '').trim(), kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null }))
+      .map(d => ({ name: (d?.name || '').trim(), kennelType: d?.kennelType || null, graduationStatus: d?.graduationStatus || null, dogIndex: Number.isInteger(d?.dogIndex) ? d.dogIndex : null }))
       .filter(d => d.name);
     if (cleanDogs.length === 0) return res.status(400).json({ error: 'At least one dog name is required' });
 
     const contactId = existingContactId || (await upsertContact({ email, phone, firstName, lastName }))?.id;
     if (!contactId) throw new Error('Could not find or create GHL contact');
+
+    // Same as the public endpoint: if staff picked a known dog by
+    // name, resolve its kennel category from the contact directly
+    // rather than leaving it to the dropdown they may not have touched.
+    if (cleanDogs.some(d => d.dogIndex !== null && !d.kennelType)) {
+      const fullContact = await getContact(contactId).catch(() => null);
+      if (fullContact) {
+        cleanDogs.forEach(dog => {
+          if (dog.dogIndex !== null && !dog.kennelType) {
+            const cat = resolvePerDogKennelCategory(fullContact, dog.dogIndex);
+            if (cat) {
+              dog.kennelType = cat.kennel_type;
+              dog.graduationStatus = cat.kennel_grad_status;
+            }
+          }
+        });
+      }
+    }
 
     const cals = CONFIG.CALENDARS[serviceType];
     if (!cals.DROPOFF_INPERSON || !cals.PICKUP_INPERSON) {
@@ -1916,6 +2077,45 @@ app.patch('/api/stays/:id/cancel', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     await logSync({ stayId: req.params.id, direction: 'db_to_ghl', action: 'cancelled', payload: {}, status: 'failed', errorMessage: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Persists dog name / owner name edits from the portal, and — if the
+// dog's name changed — quietly pushes the corrected title to that
+// specific stay's own GHL appointments (matched by the exact IDs
+// stored on this stay, never a broader lookup). Quiet update: this is
+// a data correction, not a real reschedule/status change, so it
+// shouldn't re-trigger confirmation emails or other GHL workflows.
+app.patch('/api/stays/:id/details', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { dog_name, owner_name } = req.body;
+
+    const { data: stay, error } = await supabase.from('boarding_stays').select('*').eq('id', id).single();
+    if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
+
+    const update = { last_modified_source: 'portal', last_synced_at: new Date().toISOString() };
+    if (dog_name !== undefined)   update.dog_name = dog_name;
+    if (owner_name !== undefined) update.owner_name = owner_name;
+
+    await supabase.from('boarding_stays').update(update).eq('id', id);
+
+    if (dog_name && dog_name !== stay.dog_name) {
+      const svcLabel = stay.service_type === 'boarding' ? 'Boarding' : stay.service_type;
+      const titleUpdates = [];
+      if (stay.ghl_dropoff_appointment_id) {
+        titleUpdates.push(updateAppointmentQuietly(stay.ghl_dropoff_appointment_id, { title: `${dog_name} — ${svcLabel} Drop Off` }));
+      }
+      if (stay.ghl_pickup_appointment_id) {
+        titleUpdates.push(updateAppointmentQuietly(stay.ghl_pickup_appointment_id, { title: `${dog_name} — ${svcLabel} Pick Up` }));
+      }
+      await Promise.all(titleUpdates).catch(err => console.error(`Quiet title update failed for stay ${id}:`, describeGhlError(err)));
+    }
+
+    await logSync({ stayId: id, direction: 'db_to_ghl', action: 'details_updated', payload: { dog_name, owner_name }, status: 'success' });
+    res.json({ success: true });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
