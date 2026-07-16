@@ -1872,6 +1872,50 @@ app.get('/api/contacts/:contactId/dogs', async (req, res) => {
 // at this point (no contactId yet) — exact-match lookup only, never
 // creates a contact. If nothing matches, dogs comes back empty and
 // the client just gets the normal free-text new-dog flow.
+// TEMPORARY DEBUG ENDPOINT — returns the raw GHL contact object,
+// including the full customFields array with real keys/IDs, so we can
+// see exactly what your dog-name fields are actually called instead
+// of guessing spellings. Remove this once the per-dog field keys are
+// confirmed and working — it's not something to leave exposed
+// long-term since it dumps full contact data.
+app.get('/api/debug/contact-fields', async (req, res) => {
+  try {
+    const email = (req.query.email || '').trim().toLowerCase();
+    const phone = (req.query.phone || '').trim();
+    const contactId = (req.query.contactId || '').trim();
+
+    let contact = null;
+    if (contactId) {
+      contact = await getContact(contactId);
+    } else if (email || phone) {
+      const normPhone = normalizePhone(phone);
+      const searchTerms = [email, phone, normPhone].filter(Boolean);
+      let match = null;
+      for (const term of searchTerms) {
+        const candidates = await searchContacts(term);
+        match = candidates.find(c =>
+          (email && c.email && c.email.trim().toLowerCase() === email) ||
+          (normPhone && normalizePhone(c.phone) === normPhone)
+        );
+        if (match) break;
+      }
+      if (match) contact = await getContact(match.id);
+    }
+
+    if (!contact) return res.json({ found: false, message: 'No contact matched — check the email/phone/contactId you passed in.' });
+
+    res.json({
+      found: true,
+      contactId: contact.id,
+      topLevelKeys: Object.keys(contact),
+      customFields: contact.customFields || contact.customField || contact.custom_fields || 'none found on this contact object',
+      fullContact: contact,
+    });
+  } catch (err) {
+    res.status(500).json({ error: describeGhlError(err) });
+  }
+});
+
 app.get('/api/contacts/lookup', async (req, res) => {
   try {
     const email = (req.query.email || '').trim().toLowerCase();
