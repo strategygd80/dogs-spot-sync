@@ -778,9 +778,9 @@ function resolvePerDogKennelCategory(flatPayload, dogIndex) {
 // what's actually configured in GHL, dog names will keep silently
 // failing to resolve exactly like they were before this fix.
 const PER_DOG_NAME_KEYS = [
-  ['dog_1_name', 'dog1_name', 'Dog 1 Name', "Dog's Name"],
-  ['dog_2_name', 'dog2_name', 'Dog 2 Name'],
-  ['dog_3_name', 'dog3_name', 'Dog 3 Name'],
+  ['dog_1_name', 'dog_name_1', 'dog1_name', 'Dog 1 Name', "Dog's Name"],
+  ['dog_2_name', 'dog_name_2', 'dog2_name', 'Dog 2 Name'],
+  ['dog_3_name', 'dog_name_3', 'dog3_name', 'Dog 3 Name'],
 ];
 
 function resolvePerDogName(flatPayload, dogIndex) {
@@ -1879,11 +1879,36 @@ app.get('/api/contacts/lookup', async (req, res) => {
     if (!email && !phone) return res.json({ contactId: null, dogs: [] });
 
     const normPhone = normalizePhone(phone);
-    const candidates = await searchContacts(email || phone);
-    const match = candidates.find(c =>
-      (email && c.email && c.email.trim().toLowerCase() === email) ||
-      (normPhone && normalizePhone(c.phone) === normPhone)
-    );
+
+    // GHL's generic query search reliably matches name/email, but
+    // phone-number text search isn't consistently indexed the same
+    // way — a query for raw digits can miss a contact whose phone is
+    // stored/indexed with formatting (or vice versa). Try a few
+    // reasonable variants rather than just one, since we don't know
+    // for certain which form your account matches on.
+    const searchTerms = [];
+    if (email) searchTerms.push(email);
+    if (phone) {
+      searchTerms.push(phone);
+      if (normPhone) {
+        searchTerms.push(normPhone);
+        searchTerms.push('+1' + normPhone);
+        if (normPhone.length === 10) {
+          searchTerms.push(`(${normPhone.slice(0,3)}) ${normPhone.slice(3,6)}-${normPhone.slice(6)}`);
+        }
+      }
+    }
+
+    let match = null;
+    for (const term of searchTerms) {
+      const candidates = await searchContacts(term);
+      match = candidates.find(c =>
+        (email && c.email && c.email.trim().toLowerCase() === email) ||
+        (normPhone && normalizePhone(c.phone) === normPhone)
+      );
+      if (match) break;
+    }
+
     if (!match) return res.json({ contactId: null, dogs: [] });
 
     const contact = await getContact(match.id);
