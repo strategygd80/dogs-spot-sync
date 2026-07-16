@@ -327,15 +327,16 @@ async function upsertContact({ email, phone, firstName, lastName }) {
 // source of truth these fields live on; the appointment is a separate
 // object we don't need to touch for this.
 //
-// Uses the first candidate key in each PER_DOG_NAME_KEYS/
-// PER_DOG_KENNEL_CATEGORY_KEYS slot as the canonical write-key — same
-// caveat as before: if this doesn't actually match your GHL field
-// key, the write will silently no-op rather than error, so confirm
-// with a real edit + check the contact record directly.
+// Uses the confirmed per-dog custom field ID as the write key for
+// names (PER_DOG_NAME_FIELD_IDS), and the first candidate key in
+// PER_DOG_KENNEL_CATEGORY_KEYS for kennel category — same caveat as
+// before on the latter: if that key doesn't actually match your GHL
+// field key, the write will silently no-op rather than error, so
+// confirm with a real edit + check the contact record directly.
 async function updateContactPerDogField(contactId, dogIndex, { name, kennelCategoryText }) {
   const customFields = [];
   if (name !== undefined && name !== null) {
-    customFields.push({ key: PER_DOG_NAME_KEYS[dogIndex][0], field_value: name });
+    customFields.push({ id: PER_DOG_NAME_FIELD_IDS[dogIndex], field_value: name });
   }
   if (kennelCategoryText !== undefined && kennelCategoryText !== null) {
     customFields.push({ key: PER_DOG_KENNEL_CATEGORY_KEYS[dogIndex][0], field_value: kennelCategoryText });
@@ -773,10 +774,15 @@ function resolvePerDogKennelCategory(flatPayload, dogIndex) {
 }
 
 // Per-dog NAME fields on the contact — mirrors the kennel category
-// pattern above. Hedges across a few likely key spellings since the
-// exact custom field key wasn't confirmed; if none of these match
-// what's actually configured in GHL, dog names will keep silently
-// failing to resolve exactly like they were before this fix.
+// pattern above. Confirmed real GHL custom field IDs, one per dog
+// slot. These are the authoritative lookup; the string keys below are
+// kept only as a fallback for payload shapes that expose the field by
+// name instead of ID (e.g. some workflow webhooks).
+const PER_DOG_NAME_FIELD_IDS = [
+  'sgSZk28fKwmdbLb42EU',   // dog 1
+  'WqFrQT1kwog2nIKg9afV',  // dog 2
+  'VmsYQGEZSWdkVfdcjkfF',  // dog 3
+];
 const PER_DOG_NAME_KEYS = [
   ['dog_1_name', 'dog_name_1', 'dog1_name', 'Dog 1 Name', "Dog's Name"],
   ['dog_2_name', 'dog_name_2', 'dog2_name', 'Dog 2 Name'],
@@ -784,7 +790,7 @@ const PER_DOG_NAME_KEYS = [
 ];
 
 function resolvePerDogName(flatPayload, dogIndex) {
-  return getCustomFieldValue(flatPayload, null, PER_DOG_NAME_KEYS[dogIndex]);
+  return getCustomFieldValue(flatPayload, [PER_DOG_NAME_FIELD_IDS[dogIndex]], PER_DOG_NAME_KEYS[dogIndex]);
 }
 
 // Returns every dog slot (0-2) that has a name on file for this
@@ -1878,6 +1884,24 @@ app.get('/api/contacts/:contactId/dogs', async (req, res) => {
 // of guessing spellings. Remove this once the per-dog field keys are
 // confirmed and working — it's not something to leave exposed
 // long-term since it dumps full contact data.
+// TEMPORARY DEBUG ENDPOINT — lists every custom field DEFINITION on
+// your location (id + actual name), which is the authoritative way to
+// figure out which field ID means "Dog 1 Name" vs "Dog 2 Name" etc.
+// GHL's contact API only returns field IDs, never names, so this is
+// how we translate id -> name instead of guessing from values.
+app.get('/api/debug/custom-fields', async (req, res) => {
+  try {
+    const res1 = await ghl.get(`/locations/${CONFIG.GHL_LOCATION}/customFields`);
+    const fields = res1.data?.customFields || res1.data?.fields || res1.data || [];
+    const simplified = Array.isArray(fields)
+      ? fields.map(f => ({ id: f.id, name: f.name, fieldKey: f.fieldKey || f.key, dataType: f.dataType }))
+      : fields;
+    res.json({ count: Array.isArray(simplified) ? simplified.length : undefined, fields: simplified });
+  } catch (err) {
+    res.status(500).json({ error: describeGhlError(err) });
+  }
+});
+
 app.get('/api/debug/contact-fields', async (req, res) => {
   try {
     const email = (req.query.email || '').trim().toLowerCase();
