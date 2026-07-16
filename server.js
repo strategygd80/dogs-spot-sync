@@ -1319,8 +1319,6 @@ async function autoHealTimelineQueue() {
       });
 
       if (matchingLeg && (matchingLeg.id || matchingLeg.appointmentId)) {
-        console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unifying stay...`);
-        
         const isDropoff = missingRole === 'dropoff';
         const targetCalId = matchingLeg.calendarId;
         const source = CALENDAR_LOOKUP[targetCalId]?.source || 'internal';
@@ -1336,7 +1334,18 @@ async function autoHealTimelineQueue() {
           last_synced_at: new Date().toISOString()
         };
 
-        await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
+        const { error: healError } = await supabase.from('boarding_stays').update(updatePayload).eq('id', stay.id);
+
+        if (healError) {
+          // This is exactly what was causing the same person to be
+          // "found" and "unified" every single tick forever — the
+          // update was failing silently, so the stay never actually
+          // left 'incomplete' status and kept getting picked up again.
+          console.error(`[Timeline Healer] FAILED to unify stay ${stay.id} for ${stay.owner_name}:`, JSON.stringify(healError));
+          continue;
+        }
+
+        console.log(`[Timeline Healer] Found missing ${missingRole} leg for ${stay.owner_name}. Unified stay ${stay.id}.`);
         await assignKennelAndSave(stay.id).catch(() => null);
         await logSync({ stayId: stay.id, ghlAppointmentId: matchingLeg.id || matchingLeg.appointmentId, direction: 'ghl_to_db', action: 'auto_healed_timeline', payload: matchingLeg });
       }
