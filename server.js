@@ -320,6 +320,54 @@ async function upsertContact({ email, phone, firstName, lastName }) {
   return res.data?.contact || res.data;
 }
 
+// Writes directly to a contact's own per-dog custom fields
+// (dog_1_name/_2/_3, kennel_category/_2/_3) — this is what actually
+// needs updating when staff correct a dog's name or kennel category
+// from the portal, NOT the appointment. GHL's contact record is the
+// source of truth these fields live on; the appointment is a separate
+// object we don't need to touch for this.
+//
+// Uses the first candidate key in each PER_DOG_NAME_KEYS/
+// PER_DOG_KENNEL_CATEGORY_KEYS slot as the canonical write-key — same
+// caveat as before: if this doesn't actually match your GHL field
+// key, the write will silently no-op rather than error, so confirm
+// with a real edit + check the contact record directly.
+async function updateContactPerDogField(contactId, dogIndex, { name, kennelCategoryText }) {
+  const customFields = [];
+  if (name !== undefined && name !== null) {
+    customFields.push({ key: PER_DOG_NAME_KEYS[dogIndex][0], field_value: name });
+  }
+  if (kennelCategoryText !== undefined && kennelCategoryText !== null) {
+    customFields.push({ key: PER_DOG_KENNEL_CATEGORY_KEYS[dogIndex][0], field_value: kennelCategoryText });
+  }
+  if (customFields.length === 0) return null;
+
+  const res = await ghl.put(`/contacts/${contactId}`, { customFields });
+  return res.data;
+}
+
+// Determines which dog slot (0/1/2) a stay represents, WITHOUT a new
+// database column — by finding this stay's position among the same
+// contact's other open stays, sorted by creation order (same trick
+// already used elsewhere in this file). Dog 1 = created first.
+async function getDogIndexForStay(stay) {
+  if (!stay.contact_id) return null;
+  const { data: siblings } = await supabase
+    .from('boarding_stays')
+    .select('id, ghl_date_added')
+    .eq('contact_id', stay.contact_id)
+    .not('status', 'in', '(cancelled,completed)');
+  if (!siblings || siblings.length === 0) return 0;
+
+  const ordered = [...siblings].sort((a, b) => {
+    const ta = a.ghl_date_added ? new Date(a.ghl_date_added).getTime() : 0;
+    const tb = b.ghl_date_added ? new Date(b.ghl_date_added).getTime() : 0;
+    return ta - tb;
+  });
+  const idx = ordered.findIndex(s => s.id === stay.id);
+  return Math.min(Math.max(idx, 0), PER_DOG_NAME_KEYS.length - 1);
+}
+
 // Simple type-ahead contact search for staff — matches by name, email,
 // or phone against GHL's basic query search.
 async function searchContacts(query) {
@@ -497,6 +545,33 @@ const KENNEL_CATEGORY_MAP = {
 // on a separator, this just looks for the relevant keywords anywhere
 // in the string, so both styles (and any price/day suffix) parse the
 // same way.
+// Reverse of parseKennelCategoryText — turns our internal
+// {kennelType, graduationStatus} back into the exact text format your
+// survey's dropdown already uses, so writing this back to the
+// kennel_category contact field looks the same as if you'd picked it
+// from that dropdown yourself. Matches your exact label style per
+// category (Small uses a dash, Regular/Special Needs don't, and
+// "Non Graduate" vs "Non-Graduate" differs between them — preserved
+// exactly as you showed me, not normalized).
+function formatKennelCategoryForGHL(kennelType, graduationStatus) {
+  const TYPE_LABELS = { special_needs: 'Special Needs', regular: 'Regular', small: 'Small', overflow: 'Overflow' };
+  const typeLabel = TYPE_LABELS[kennelType] || kennelType;
+  if (!typeLabel) return null;
+  if (kennelType === 'overflow' || !graduationStatus) return typeLabel;
+
+  if (kennelType === 'small') {
+    const gradLabel = { graduated: 'Graduated', non_graduate: 'Non-Graduate', in_process: 'In Process' }[graduationStatus] || graduationStatus;
+    return `${typeLabel} - ${gradLabel}`;
+  }
+  if (kennelType === 'special_needs') {
+    const gradLabel = { graduated: 'Graduate', non_graduate: 'Non-Graduate', in_process: 'In Process' }[graduationStatus] || graduationStatus;
+    return `${typeLabel} ${gradLabel}`;
+  }
+  // regular
+  const gradLabel = { graduated: 'Graduate', non_graduate: 'Non Graduate', in_process: 'In Process' }[graduationStatus] || graduationStatus;
+  return `${typeLabel} ${gradLabel}`;
+}
+
 function parseKennelCategoryText(raw) {
   if (!raw) return null;
   const normalized = String(raw).toLowerCase();
@@ -1443,6 +1518,9 @@ app.patch('/api/stays/:id/kennel', async (req, res) => {
     const { data: stay, error } = await supabase.from('boarding_stays').select('*').eq('id', id).single();
     if (error || !stay) return res.status(404).json({ error: 'Stay not found' });
 
+    let resultingType = stay.kennel_type;
+    let resultingGrad = graduation_status !== undefined ? graduation_status : stay.graduation_status;
+
     if (kennel_id) {
       const { data: kennel, error: kErr } = await supabase.from('kennels').select('*').eq('id', kennel_id).single();
       if (kErr || !kennel) return res.status(404).json({ error: 'Kennel not found' });
@@ -1452,18 +1530,36 @@ app.patch('/api/stays/:id/kennel', async (req, res) => {
         console.warn(`Manual kennel assignment: ${kennel_id} for stay ${id} overlaps another stay's dates — proceeding anyway.`);
       }
 
+      resultingType = kennel.type;
       await supabase.from('boarding_stays').update({
         kennel_id, kennel_type: kennel.type, kennel_status: 'assigned',
-        graduation_status: graduation_status !== undefined ? graduation_status : stay.graduation_status,
+        graduation_status: resultingGrad,
         last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
       }).eq('id', id);
     } else {
       await supabase.from('boarding_stays').update({
         kennel_id: null,
         kennel_status: stay.kennel_type ? 'unassigned' : 'needs_size',
-        graduation_status: graduation_status !== undefined ? graduation_status : stay.graduation_status,
+        graduation_status: resultingGrad,
         last_modified_source: 'portal', last_synced_at: new Date().toISOString(),
       }).eq('id', id);
+    }
+
+    // Push the resulting category to the CONTACT's own per-dog kennel
+    // field — same reasoning as dog name: GHL identifies which dog's
+    // category this is via the contact record, not the appointment.
+    // Formatted to match your survey's exact dropdown text (e.g.
+    // "Regular Non Graduate", "Special Needs Graduate", "Small -
+    // Graduated") so it looks the same as if picked from that dropdown.
+    if (resultingType && stay.contact_id) {
+      const categoryText = formatKennelCategoryForGHL(resultingType, resultingGrad);
+      if (categoryText) {
+        const dogIndex = await getDogIndexForStay(stay);
+        if (dogIndex !== null) {
+          await updateContactPerDogField(stay.contact_id, dogIndex, { kennelCategoryText: categoryText })
+            .catch(err => console.error(`Contact kennel-category push failed for stay ${id} (dog index ${dogIndex}):`, describeGhlError(err)));
+        }
+      }
     }
 
     await logSync({ stayId: id, direction: 'db_to_ghl', action: 'kennel reassigned', payload: req.body, status: 'success' });
@@ -2101,16 +2197,18 @@ app.patch('/api/stays/:id/details', async (req, res) => {
 
     await supabase.from('boarding_stays').update(update).eq('id', id);
 
-    if (dog_name && dog_name !== stay.dog_name) {
-      const svcLabel = stay.service_type === 'boarding' ? 'Boarding' : stay.service_type;
-      const titleUpdates = [];
-      if (stay.ghl_dropoff_appointment_id) {
-        titleUpdates.push(updateAppointmentQuietly(stay.ghl_dropoff_appointment_id, { title: `${dog_name} — ${svcLabel} Drop Off` }));
+    // Push to GHL by CONTACT, not by appointment. GHL doesn't identify
+    // which dog an appointment is for by looking at the appointment
+    // itself — it's the contact's dog_1_name/_2/_3 field that carries
+    // that identity. So find this stay's dog slot (by creation order
+    // among the contact's other open stays) and correct that specific
+    // field on the contact.
+    if (dog_name && dog_name !== stay.dog_name && stay.contact_id) {
+      const dogIndex = await getDogIndexForStay(stay);
+      if (dogIndex !== null) {
+        await updateContactPerDogField(stay.contact_id, dogIndex, { name: dog_name })
+          .catch(err => console.error(`Contact dog-name push failed for stay ${id} (dog index ${dogIndex}):`, describeGhlError(err)));
       }
-      if (stay.ghl_pickup_appointment_id) {
-        titleUpdates.push(updateAppointmentQuietly(stay.ghl_pickup_appointment_id, { title: `${dog_name} — ${svcLabel} Pick Up` }));
-      }
-      await Promise.all(titleUpdates).catch(err => console.error(`Quiet title update failed for stay ${id}:`, describeGhlError(err)));
     }
 
     await logSync({ stayId: id, direction: 'db_to_ghl', action: 'details_updated', payload: { dog_name, owner_name }, status: 'success' });
